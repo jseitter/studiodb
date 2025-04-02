@@ -15,12 +15,14 @@ StudioDB is a simplified relational database system designed for educational pur
 - **Buffer Management**: Configurable buffer pools for each tablespace
 - **Database Objects**: Support for Tables and B-Tree Indexes
 - **SQL Frontend**: Basic SQL operations (SELECT, INSERT, UPDATE, DELETE, CREATE TABLE, CREATE INDEX)
+- **Visualization Interface**: Interactive web-based visualization of database internals
 
 ## Building and Running
 
 ### Prerequisites
 - Java 11 or higher
 - Gradle 6.8 or higher
+- Node.js 16+ and npm (for the visualization interface)
 
 ### Build
 ```
@@ -31,6 +33,24 @@ StudioDB is a simplified relational database system designed for educational pur
 ```
 ./gradlew run
 ```
+
+### Start with visualization interface
+```
+./gradlew runWithViz
+```
+
+## Visualization Interface
+
+The visualization interface provides an interactive way to observe and understand the internal workings of the database system:
+
+- Real-time visualization of tablespaces, pages, and buffer pools
+- Animated page transfers between disk and memory
+- Visual indicators for page states (clean, dirty, pinned)
+- B-Tree structure and operations visualization
+- Table and row data visualization
+- Query execution visualization with step-by-step animation
+
+Access the visualization interface by visiting `http://localhost:8080` in your web browser when running with the visualization option enabled.
 
 ## SQL Command Reference
 

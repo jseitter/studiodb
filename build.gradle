@@ -2,6 +2,7 @@ plugins {
     id 'java'
     id 'application'
     id 'com.github.johnrengelman.shadow' version '7.1.2'
+    id 'com.github.node-gradle.node' version '3.5.1'
 }
 
 group 'net.seitter.studiodb'
@@ -20,6 +21,16 @@ dependencies {
     implementation 'com.google.guava:guava:31.0.1-jre'
     implementation 'org.antlr:antlr4-runtime:4.9.3'
     
+    // Web server dependencies
+    implementation 'io.javalin:javalin:5.6.3'
+    implementation 'org.webjars.npm:swagger-ui-dist:5.10.0'
+    implementation 'com.fasterxml.jackson.core:jackson-databind:2.15.2'
+    implementation 'com.fasterxml.jackson.datatype:jackson-datatype-jsr310:2.15.2'
+    
+    // WebSocket support
+    implementation 'org.eclipse.jetty.websocket:websocket-jetty-server:11.0.15'
+    implementation 'org.eclipse.jetty.websocket:websocket-jetty-client:11.0.15'
+    
     testImplementation 'org.junit.jupiter:junit-jupiter-api:5.8.2'
     testRuntimeOnly 'org.junit.jupiter:junit-jupiter-engine:5.8.2'
 }
@@ -37,6 +48,83 @@ shadowJar {
         attributes 'Main-Class': application.mainClass
     }
     mergeServiceFiles()
+}
+
+// Node plugin configuration for the frontend
+node {
+    version = '18.17.1'
+    download = true
+    nodeProjectDir = file("${project.projectDir}/web-ui")
+}
+
+// Task to create React app if it doesn't exist
+task createReactApp(type: Exec) {
+    workingDir = file("${project.projectDir}")
+    commandLine 'node_modules/.bin/create-vite', 'web-ui', '--template', 'react-ts'
+    
+    doFirst {
+        if (!file("${project.projectDir}/web-ui").exists()) {
+            // Install create-vite if not already installed
+            exec {
+                workingDir = file("${project.projectDir}")
+                commandLine 'npm', 'install', 'create-vite'
+            }
+        } else {
+            // Skip if web-ui directory already exists
+            logger.info('web-ui directory already exists, skipping creation')
+            commandLine 'echo', 'Skipping create-vite, web-ui already exists'
+        }
+    }
+}
+
+// Task to build the React app
+task buildReactApp(type: NpmTask) {
+    dependsOn npmInstall
+    
+    args = ['run', 'build']
+    workingDir = file("${project.projectDir}/web-ui")
+    
+    doFirst {
+        // Skip the task if web-ui doesn't exist yet
+        if (!file("${project.projectDir}/web-ui").exists()) {
+            logger.info('web-ui directory doesn\'t exist, skipping build')
+            commandLine 'echo', 'Skipping build, web-ui doesn\'t exist'
+            enabled = false
+        }
+    }
+}
+
+// Task to copy the built React app to the resources directory
+task copyReactApp(type: Copy) {
+    dependsOn buildReactApp
+    
+    from "${project.projectDir}/web-ui/dist"
+    into "${project.buildDir}/resources/main/public"
+    
+    doFirst {
+        // Skip the task if dist directory doesn't exist
+        if (!file("${project.projectDir}/web-ui/dist").exists()) {
+            logger.info('web-ui/dist directory doesn\'t exist, skipping copy')
+            enabled = false
+        }
+    }
+}
+
+// Make the build task depend on copyReactApp if web-ui exists
+tasks.whenTaskAdded { task ->
+    if (task.name == 'processResources' && file("${project.projectDir}/web-ui").exists()) {
+        task.dependsOn(copyReactApp)
+    }
+}
+
+// Custom task to run with visualization interface
+task runWithViz(type: JavaExec) {
+    dependsOn classes
+    group = 'application'
+    description = 'Runs StudioDB with visualization interface'
+    classpath = sourceSets.main.runtimeClasspath
+    mainClass = application.mainClass
+    args = ['--viz']
 }
 
 // Make the build task depend on shadowJar

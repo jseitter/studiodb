@@ -1,11 +1,14 @@
 package net.seitter.studiodb;
 
 import net.seitter.studiodb.sql.SQLEngine;
+import net.seitter.studiodb.web.DatabaseSystemInstrumenter;
+import net.seitter.studiodb.web.WebServer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.BufferedReader;
 import java.io.InputStreamReader;
+import java.util.Arrays;
 
 /**
  * Main class for StudioDB - an educational database system.
@@ -14,16 +17,48 @@ public class StudioDB {
     private static final Logger logger = LoggerFactory.getLogger(StudioDB.class);
     private final DatabaseSystem dbSystem;
     private final SQLEngine sqlEngine;
+    private WebServer webServer;
+    private boolean visualizationEnabled = false;
 
-    public StudioDB() {
+    public StudioDB(boolean enableVisualization) {
         logger.info("Initializing StudioDB...");
         this.dbSystem = new DatabaseSystem();
         this.sqlEngine = new SQLEngine(dbSystem);
+        this.visualizationEnabled = enableVisualization;
+        
+        if (visualizationEnabled) {
+            initializeVisualization();
+        }
+        
         logger.info("StudioDB initialized successfully");
+    }
+
+    /**
+     * Initializes the visualization components.
+     */
+    private void initializeVisualization() {
+        try {
+            // Initialize web server
+            this.webServer = new WebServer(dbSystem, 8080);
+            logger.info("Visualization web server initialized");
+            
+            // Instrument database system components
+            DatabaseSystemInstrumenter instrumenter = new DatabaseSystemInstrumenter(dbSystem, webServer);
+            instrumenter.instrumentComponents();
+            logger.info("Database components instrumented for visualization");
+        } catch (Exception e) {
+            logger.error("Failed to initialize visualization components", e);
+        }
     }
 
     public void start() {
         logger.info("Starting StudioDB...");
+        
+        // Start the web server if visualization is enabled
+        if (visualizationEnabled && webServer != null) {
+            webServer.start();
+            logger.info("Visualization interface started at http://localhost:8080");
+        }
         
         // Start the interactive SQL shell
         try (BufferedReader reader = new BufferedReader(new InputStreamReader(System.in))) {
@@ -136,6 +171,12 @@ public class StudioDB {
         System.out.println("BOOLEAN                        True/false value");
         System.out.println("DATE                           Date value (YYYY-MM-DD)");
         
+        // Visualization
+        if (visualizationEnabled) {
+            System.out.println("\n-- Visualization --");
+            System.out.println("Visualization interface available at: http://localhost:8080");
+        }
+        
         System.out.println("\nNote: All SQL commands must end with a semicolon (;)");
         System.out.println("Note: The system automatically persists all database objects in the system catalog");
         System.out.println("=====================\n");
@@ -143,12 +184,22 @@ public class StudioDB {
 
     public void shutdown() {
         logger.info("Shutting down StudioDB...");
+        
+        // Stop the web server if it's running
+        if (webServer != null) {
+            webServer.stop();
+            logger.info("Visualization interface stopped");
+        }
+        
         dbSystem.shutdown();
         logger.info("StudioDB shutdown complete");
     }
 
     public static void main(String[] args) {
-        StudioDB studioDB = new StudioDB();
+        // Check if we should enable visualization
+        boolean enableVisualization = Arrays.asList(args).contains("--viz");
+        
+        StudioDB studioDB = new StudioDB(enableVisualization);
         studioDB.start();
     }
 } 
