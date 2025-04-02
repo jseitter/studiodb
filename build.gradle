@@ -1,0 +1,49 @@
+plugins {
+    id 'java'
+    id 'application'
+    id 'com.github.johnrengelman.shadow' version '7.1.2'
+}
+
+group 'net.seitter.studiodb'
+version '1.0-SNAPSHOT'
+
+sourceCompatibility = 11
+targetCompatibility = 11
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    implementation 'org.slf4j:slf4j-api:1.7.32'
+    implementation 'ch.qos.logback:logback-classic:1.2.9'
+    implementation 'com.google.guava:guava:31.0.1-jre'
+    implementation 'org.antlr:antlr4-runtime:4.9.3'
+    
+    testImplementation 'org.junit.jupiter:junit-jupiter-api:5.8.2'
+    testRuntimeOnly 'org.junit.jupiter:junit-jupiter-engine:5.8.2'
+}
+
+application {
+    mainClass = 'net.seitter.studiodb.StudioDB'
+}
+
+// Configuration for the shadow jar (fat jar) plugin
+shadowJar {
+    archiveBaseName.set('studiodb')
+    archiveClassifier.set('')
+    archiveVersion.set(project.version.toString())
+    manifest {
+        attributes 'Main-Class': application.mainClass
+    }
+    mergeServiceFiles()
+}
+
+// Make the build task depend on shadowJar
+build {
+    dependsOn shadowJar
+}
+
+test {
+    useJUnitPlatform()
+} 
