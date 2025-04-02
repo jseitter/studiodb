@@ -137,3 +137,17 @@ DATE                           Date value (YYYY-MM-DD)
 ## Educational Purpose
 
 This project is specifically designed to illustrate database internals and is not intended for production use. It prioritizes clarity of concepts over performance or feature completeness. 
+
+### Visualization Examples
+
+Dashboard
+<img width="1510" alt="image" src="https://github.com/user-attachments/assets/d797a0bc-0179-4af5-8b6c-035310589fa9" />
+
+Tablespace Overview
+<img width="1486" alt="image" src="https://github.com/user-attachments/assets/3644eb34-bd82-446b-8347-41d39cd0a4aa" />
+
+Bufferpool Overview
+<img width="1489" alt="image" src="https://github.com/user-attachments/assets/5dfc8f63-7312-418b-983d-f8cd49230db1" />
+
+
+
