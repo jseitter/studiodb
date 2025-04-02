@@ -30,7 +30,7 @@ jobs:
         run: ./gradlew shadowJar
 
       - name: Upload Shadow JAR
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
-          name: studidb-jar
-          path: build/libs/studidb-*.jar 
+          name: studiodb-jar
+          path: build/libs/studiodb-*.jar 

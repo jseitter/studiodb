@@ -35,5 +35,5 @@ jobs:
           name: Release ${{ github.ref_name }}
           draft: false
           prerelease: false
-          files: build/libs/studidb-*.jar
+          files: build/libs/studiodb-*.jar
           generate_release_notes: true 
