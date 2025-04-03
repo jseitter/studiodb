@@ -3,6 +3,7 @@ package net.seitter.studiodb.web;
 import net.seitter.studiodb.DatabaseSystem;
 import net.seitter.studiodb.buffer.BufferPoolManager;
 import net.seitter.studiodb.buffer.BufferPoolManagerInstrumenter;
+import net.seitter.studiodb.buffer.IBufferPoolManager;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -58,20 +59,20 @@ public class DatabaseSystemInstrumenter {
         Field bufferPoolManagersField = DatabaseSystem.class.getDeclaredField("bufferPoolManagers");
         bufferPoolManagersField.setAccessible(true);
         
-        Map<String, BufferPoolManager> originalManagers = 
-                (Map<String, BufferPoolManager>) bufferPoolManagersField.get(dbSystem);
+        Map<String, IBufferPoolManager> originalManagers = 
+                (Map<String, IBufferPoolManager>) bufferPoolManagersField.get(dbSystem);
         
         // Create proxies for all buffer pool managers
-        Map<String, BufferPoolManager> proxiedManagers = new HashMap<>();
+        Map<String, IBufferPoolManager> proxiedManagers = new HashMap<>();
         
-        for (Map.Entry<String, BufferPoolManager> entry : originalManagers.entrySet()) {
+        for (Map.Entry<String, IBufferPoolManager> entry : originalManagers.entrySet()) {
             String name = entry.getKey();
-            BufferPoolManager original = entry.getValue();
+            IBufferPoolManager original = entry.getValue();
             
             // Create a proxy
             BufferPoolManagerInstrumenter instrumenter = 
                     new BufferPoolManagerInstrumenter(original, webServer);
-            BufferPoolManager proxy = instrumenter.createProxy();
+            IBufferPoolManager proxy = instrumenter.createProxy();
             
             proxiedManagers.put(name, proxy);
             logger.debug("Instrumented buffer pool manager for tablespace '{}'", name);

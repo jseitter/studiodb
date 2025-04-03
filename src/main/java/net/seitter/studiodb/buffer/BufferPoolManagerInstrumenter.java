@@ -18,7 +18,7 @@ import java.lang.reflect.Proxy;
  */
 public class BufferPoolManagerInstrumenter {
     private static final Logger logger = LoggerFactory.getLogger(BufferPoolManagerInstrumenter.class);
-    private final BufferPoolManager original;
+    private final IBufferPoolManager original;
     private final WebServer webServer;
 
     /**
@@ -27,7 +27,7 @@ public class BufferPoolManagerInstrumenter {
      * @param original The original buffer pool manager
      * @param webServer The web server to send events to
      */
-    public BufferPoolManagerInstrumenter(BufferPoolManager original, WebServer webServer) {
+    public BufferPoolManagerInstrumenter(IBufferPoolManager original, WebServer webServer) {
         this.original = original;
         this.webServer = webServer;
     }
@@ -37,10 +37,10 @@ public class BufferPoolManagerInstrumenter {
      *
      * @return A proxy BufferPoolManager
      */
-    public BufferPoolManager createProxy() {
-        return (BufferPoolManager) Proxy.newProxyInstance(
-                BufferPoolManager.class.getClassLoader(),
-                new Class<?>[]{BufferPoolManager.class},
+    public IBufferPoolManager createProxy() {
+        return (IBufferPoolManager) Proxy.newProxyInstance(
+                IBufferPoolManager.class.getClassLoader(),
+                new Class<?>[]{IBufferPoolManager.class},
                 new BufferPoolManagerHandler(original, webServer));
     }
 
@@ -48,10 +48,10 @@ public class BufferPoolManagerInstrumenter {
      * Invocation handler for BufferPoolManager methods.
      */
     private static class BufferPoolManagerHandler implements InvocationHandler {
-        private final BufferPoolManager target;
+        private final IBufferPoolManager target;
         private final WebServer webServer;
 
-        public BufferPoolManagerHandler(BufferPoolManager target, WebServer webServer) {
+        public BufferPoolManagerHandler(IBufferPoolManager target, WebServer webServer) {
             this.target = target;
             this.webServer = webServer;
         }
@@ -66,8 +66,8 @@ public class BufferPoolManagerInstrumenter {
                     return handleFetchPage((PageId) args[0]);
                 } else if ("unpinPage".equals(methodName) && args != null && args.length > 1) {
                     return handleUnpinPage((PageId) args[0], (Boolean) args[1]);
-                } else if ("flushPage".equals(methodName) && args != null && args.length > 0) {
-                    return handleFlushPage((PageId) args[0]);
+                } else if ("flushAll".equals(methodName)) {
+                    return handleFlushAll();
                 } else if ("allocatePage".equals(methodName)) {
                     return handleAllocatePage();
                 } else {
@@ -113,9 +113,9 @@ public class BufferPoolManagerInstrumenter {
         /**
          * Handles unpinPage method calls.
          */
-        private boolean handleUnpinPage(PageId pageId, boolean isDirty) {
+        private Object handleUnpinPage(PageId pageId, boolean isDirty) {
             // Execute the original method
-            boolean result = target.unpinPage(pageId, isDirty);
+            target.unpinPage(pageId, isDirty);
             
             // Capture the unpin event
             PageEvent unpinEvent = new PageEvent(
@@ -137,28 +137,26 @@ public class BufferPoolManagerInstrumenter {
                 webServer.addPageEvent(dirtyEvent);
             }
             
-            return result;
+            return null;
         }
 
         /**
-         * Handles flushPage method calls.
+         * Handles flushAll method calls.
          */
-        private boolean handleFlushPage(PageId pageId) throws IOException {
+        private Object handleFlushAll() throws IOException {
             // Execute the original method
-            boolean result = target.flushPage(pageId);
+            target.flushAll();
             
-            // Capture the event if the page was successfully flushed
-            if (result) {
-                PageEvent event = new PageEvent(
-                        pageId.getTablespaceName(),
-                        pageId.getPageNumber(),
-                        PageEvent.EventType.PAGE_WRITE,
-                        "Page written from buffer pool to disk");
-                
-                webServer.addPageEvent(event);
-            }
+            // Capture a generic event for the flush operation
+            PageEvent event = new PageEvent(
+                    target.getTablespaceName(),
+                    -1, // Not specific to any page
+                    PageEvent.EventType.BUFFER_FLUSH,
+                    "All dirty pages flushed to disk");
             
-            return result;
+            webServer.addPageEvent(event);
+            
+            return null;
         }
 
         /**

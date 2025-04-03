@@ -10,6 +10,8 @@ import io.javalin.plugin.bundled.CorsPluginConfig;
 import io.javalin.websocket.WsContext;
 import net.seitter.studiodb.DatabaseSystem;
 import net.seitter.studiodb.buffer.BufferPoolManager;
+import net.seitter.studiodb.buffer.IBufferPoolManager;
+import net.seitter.studiodb.storage.Page;
 import net.seitter.studiodb.storage.StorageManager;
 import net.seitter.studiodb.storage.Tablespace;
 import net.seitter.studiodb.web.model.BufferPoolStatus;
@@ -246,16 +248,32 @@ public class WebServer {
      * @param event The event to broadcast
      */
     private void broadcastEvent(PageEvent event) {
+        // Log the event to help with debugging
+        logger.debug("Broadcasting event: {}", event);
+        
+        // Count of active connections for logging
+        int activeConnections = 0;
+        
         // Filter out closed sessions and send to all remaining ones
-        wsConnections.keySet().stream()
-            .filter(ctx -> ctx.session.isOpen())
-            .forEach(session -> {
+        for (WsContext ctx : wsConnections.keySet()) {
+            if (ctx.session.isOpen()) {
                 try {
-                    session.send(event);
+                    ctx.send(event);
+                    activeConnections++;
                 } catch (Exception e) {
                     logger.error("Error sending event to WebSocket client", e);
                 }
-            });
+            } else {
+                // Remove closed connections
+                wsConnections.remove(ctx);
+            }
+        }
+        
+        if (activeConnections > 0) {
+            logger.debug("Event broadcast to {} connections", activeConnections);
+        } else {
+            logger.debug("No active WebSocket connections to broadcast to");
+        }
     }
 
     /**
@@ -327,19 +345,21 @@ public class WebServer {
             // Use reflection to access the private bufferPoolManagers field
             Field bufferPoolManagersField = DatabaseSystem.class.getDeclaredField("bufferPoolManagers");
             bufferPoolManagersField.setAccessible(true);
-            Map<String, BufferPoolManager> bufferPoolManagers = 
-                    (Map<String, BufferPoolManager>) bufferPoolManagersField.get(dbSystem);
+            Map<String, IBufferPoolManager> bufferPoolManagers = 
+                    (Map<String, IBufferPoolManager>) bufferPoolManagersField.get(dbSystem);
             
-            for (Map.Entry<String, BufferPoolManager> entry : bufferPoolManagers.entrySet()) {
+            for (Map.Entry<String, IBufferPoolManager> entry : bufferPoolManagers.entrySet()) {
                 String name = entry.getKey();
-                BufferPoolManager bpm = entry.getValue();
+                IBufferPoolManager bpm = entry.getValue();
                 
-                int size = bpm.getSize();
-                int capacity = bpm.getCapacity();
+                BufferPoolStatus status = new BufferPoolStatus();
+                status.setName(name);
+                status.setSize(bpm.getSize());
+                status.setCapacity(bpm.getCapacity());
+                status.setDirtyPageCount(bpm.getDirtyPageCount());
+                status.setTablespaceName(bpm.getTablespaceName());
                 
-                List<PageStatus> pages = getBufferPoolPages(bpm);
-                
-                result.add(new BufferPoolStatus(name, size, capacity, pages));
+                result.add(status);
             }
         } catch (Exception e) {
             logger.error("Error getting buffer pool statuses", e);
@@ -359,21 +379,23 @@ public class WebServer {
             // Use reflection to access the private bufferPoolManagers field
             Field bufferPoolManagersField = DatabaseSystem.class.getDeclaredField("bufferPoolManagers");
             bufferPoolManagersField.setAccessible(true);
-            Map<String, BufferPoolManager> bufferPoolManagers = 
-                    (Map<String, BufferPoolManager>) bufferPoolManagersField.get(dbSystem);
+            Map<String, IBufferPoolManager> bufferPoolManagers = 
+                    (Map<String, IBufferPoolManager>) bufferPoolManagersField.get(dbSystem);
             
-            BufferPoolManager bpm = bufferPoolManagers.get(name);
+            IBufferPoolManager bpm = bufferPoolManagers.get(name);
             
             if (bpm == null) {
                 return null;
             }
             
-            int size = bpm.getSize();
-            int capacity = bpm.getCapacity();
+            BufferPoolStatus status = new BufferPoolStatus();
+            status.setName(name);
+            status.setSize(bpm.getSize());
+            status.setCapacity(bpm.getCapacity());
+            status.setDirtyPageCount(bpm.getDirtyPageCount());
+            status.setTablespaceName(bpm.getTablespaceName());
             
-            List<PageStatus> pages = getBufferPoolPages(bpm);
-            
-            return new BufferPoolStatus(name, size, capacity, pages);
+            return status;
         } catch (Exception e) {
             logger.error("Error getting buffer pool status", e);
             return null;
@@ -386,21 +408,9 @@ public class WebServer {
      * @param bpm The buffer pool manager
      * @return A list of page statuses
      */
-    private List<PageStatus> getBufferPoolPages(BufferPoolManager bpm) {
-        List<PageStatus> result = new ArrayList<>();
-        
-        try {
-            // Use reflection to access the private pageTable field
-            Field pageTableField = BufferPoolManager.class.getDeclaredField("pageTable");
-            pageTableField.setAccessible(true);
-            Map<?, ?> pageTable = (Map<?, ?>) pageTableField.get(bpm);
-            
-            // Skip this for now as it's more complex to extract and convert the page data
-            // This would be implemented in a real system
-        } catch (Exception e) {
-            logger.error("Error getting buffer pool pages", e);
-        }
-        
-        return result;
+    private List<PageStatus> getBufferPoolPages(IBufferPoolManager bpm) {
+        // For now, return an empty list as page extraction is complex
+        // A real implementation would get the actual pages from the buffer pool
+        return new ArrayList<>();
     }
 } 

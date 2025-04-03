@@ -11,12 +11,13 @@ import java.util.HashMap;
 import java.util.LinkedList;
 import java.util.Map;
 import java.util.Queue;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * Manages a buffer pool for a single tablespace.
  * The buffer pool caches pages in memory to reduce disk I/O.
  */
-public class BufferPoolManager {
+public class BufferPoolManager implements IBufferPoolManager {
     private static final Logger logger = LoggerFactory.getLogger(BufferPoolManager.class);
 
     private final String tablespaceName;
@@ -24,6 +25,8 @@ public class BufferPoolManager {
     private final int capacity;
     private final Map<PageId, Page> pageTable;
     private final Queue<PageId> replacementQueue;
+    private final AtomicInteger dirtyPageCount;
+    private final PageCleaner pageCleaner;
 
     /**
      * Creates a new buffer pool manager.
@@ -38,6 +41,12 @@ public class BufferPoolManager {
         this.capacity = capacity;
         this.pageTable = new HashMap<>(capacity);
         this.replacementQueue = new LinkedList<>();
+        this.dirtyPageCount = new AtomicInteger(0);
+        
+        // Create and start the page cleaner
+        PageCleanerConfig cleanerConfig = PageCleanerConfig.getDefault();
+        this.pageCleaner = new PageCleaner(this, cleanerConfig);
+        this.pageCleaner.start();
 
         logger.info("Buffer pool for tablespace '{}' initialized with capacity: {} pages", 
                 tablespaceName, capacity);
@@ -100,17 +109,20 @@ public class BufferPoolManager {
      *
      * @param pageId The ID of the page to unpin
      * @param isDirty Whether the page was modified
-     * @return true if the page was successfully unpinned
      */
-    public synchronized boolean unpinPage(PageId pageId, boolean isDirty) {
+    public synchronized void unpinPage(PageId pageId, boolean isDirty) {
         if (!pageTable.containsKey(pageId)) {
             logger.warn("Attempted to unpin page {} that is not in the buffer pool", pageId);
-            return false;
+            return;
         }
 
         Page page = pageTable.get(pageId);
         
         if (isDirty) {
+            // If the page wasn't dirty before but is now, increment the dirty page count
+            if (!page.isDirty()) {
+                dirtyPageCount.incrementAndGet();
+            }
             page.markDirty();
         }
         
@@ -119,8 +131,6 @@ public class BufferPoolManager {
         if (!unpinned) {
             logger.warn("Attempted to unpin page {} with pin count already at 0", pageId);
         }
-        
-        return unpinned;
     }
 
     /**
@@ -141,6 +151,7 @@ public class BufferPoolManager {
         if (page.isDirty()) {
             storageManager.writePage(page);
             page.markClean();
+            dirtyPageCount.decrementAndGet();
             logger.debug("Flushed dirty page {} to disk", pageId);
             return true;
         }
@@ -211,6 +222,7 @@ public class BufferPoolManager {
         // If the page is dirty, write it back to disk
         if (victimPage.isDirty()) {
             storageManager.writePage(victimPage);
+            dirtyPageCount.decrementAndGet();
             logger.debug("Evicted dirty page {} and flushed to disk", victimPageId);
         } else {
             logger.debug("Evicted clean page {}", victimPageId);
@@ -222,21 +234,17 @@ public class BufferPoolManager {
      *
      * @throws IOException If there's an error writing pages to disk
      */
-    public synchronized void flushAll() {
-        try {
-            for (Page page : pageTable.values()) {
-                if (page.isDirty()) {
-                    storageManager.writePage(page);
-                    page.markClean();
-                    logger.debug("Flushed dirty page {} to disk", page.getPageId());
-                }
+    public synchronized void flushAll() throws IOException {
+        for (Page page : pageTable.values()) {
+            if (page.isDirty()) {
+                storageManager.writePage(page);
+                page.markClean();
+                dirtyPageCount.decrementAndGet();
+                logger.debug("Flushed dirty page {} to disk", page.getPageId());
             }
-            
-            logger.info("Flushed all dirty pages in buffer pool for tablespace '{}'", tablespaceName);
-        } catch (IOException e) {
-            logger.error("Error flushing dirty pages in buffer pool for tablespace '{}'", 
-                    tablespaceName, e);
         }
+        
+        logger.info("Flushed all dirty pages in buffer pool for tablespace '{}'", tablespaceName);
     }
 
     /**
@@ -262,7 +270,42 @@ public class BufferPoolManager {
      *
      * @return The tablespace name
      */
+    @Override
     public String getTablespaceName() {
         return tablespaceName;
+    }
+    
+    /**
+     * Gets the number of dirty pages in the buffer pool.
+     * 
+     * @return The number of dirty pages
+     */
+    @Override
+    public int getDirtyPageCount() {
+        return dirtyPageCount.get();
+    }
+    
+    /**
+     * Shuts down the buffer pool manager, stopping the page cleaner and flushing all dirty pages.
+     */
+    @Override
+    public void shutdown() {
+        try {
+            // Stop the page cleaner
+            if (pageCleaner != null) {
+                pageCleaner.shutdown();
+            }
+            
+            // Flush all dirty pages
+            flushAll();
+            
+            // Clear the page table and replacement queue
+            pageTable.clear();
+            replacementQueue.clear();
+            
+            logger.info("Buffer pool for tablespace '{}' shut down", tablespaceName);
+        } catch (IOException e) {
+            logger.error("Error shutting down buffer pool for tablespace '{}'", tablespaceName, e);
+        }
     }
 } 

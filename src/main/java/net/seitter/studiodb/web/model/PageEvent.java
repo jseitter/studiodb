@@ -17,7 +17,8 @@ public class PageEvent {
         PAGE_PIN,        // Page pinned in buffer pool
         PAGE_UNPIN,      // Page unpinned in buffer pool
         PAGE_DIRTY,      // Page marked as dirty
-        PAGE_EVICT       // Page evicted from buffer pool
+        PAGE_EVICT,      // Page evicted from buffer pool
+        BUFFER_FLUSH     // All dirty pages flushed to disk
     }
     
     private String tablespaceName;

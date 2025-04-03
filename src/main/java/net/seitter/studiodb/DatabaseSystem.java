@@ -1,6 +1,7 @@
 package net.seitter.studiodb;
 
 import net.seitter.studiodb.buffer.BufferPoolManager;
+import net.seitter.studiodb.buffer.IBufferPoolManager;
 import net.seitter.studiodb.schema.SchemaManager;
 import net.seitter.studiodb.storage.StorageContainer;
 import net.seitter.studiodb.storage.StorageManager;
@@ -9,6 +10,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.File;
+import java.io.IOException;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -20,7 +22,7 @@ public class DatabaseSystem {
     private static final Logger logger = LoggerFactory.getLogger(DatabaseSystem.class);
     
     private final StorageManager storageManager;
-    private final Map<String, BufferPoolManager> bufferPoolManagers;
+    private final Map<String, IBufferPoolManager> bufferPoolManagers;
     private final SchemaManager schemaManager;
     
     // Default configuration
@@ -52,8 +54,12 @@ public class DatabaseSystem {
         
         // Now that schema manager is initialized, persist system tablespace info if it was newly created
         if (systemTablespaceCreated) {
-            schemaManager.persistTablespaceToCatalog("SYSTEM", systemTablespacePath, DEFAULT_PAGE_SIZE);
-            logger.info("Persisted system tablespace information to system catalog");
+            try {
+                schemaManager.persistTablespaceToCatalog("SYSTEM", systemTablespacePath, DEFAULT_PAGE_SIZE);
+                logger.info("Persisted system tablespace information to system catalog");
+            } catch (Exception e) {
+                logger.error("Failed to persist system tablespace information", e);
+            }
         }
         
         logger.info("Database system initialized with page size: {} bytes", DEFAULT_PAGE_SIZE);
@@ -76,11 +82,11 @@ public class DatabaseSystem {
     }
     
     /**
-     * Creates a new tablespace with a single storage container.
+     * Creates a new tablespace.
      * 
      * @param tablespaceName The name of the tablespace
-     * @param containerPath The file path for the storage container
-     * @param initialSizePages The initial size in pages
+     * @param containerPath The path to the tablespace container
+     * @param initialSizePages The initial size of the tablespace in pages
      * @return true if creation was successful
      */
     public boolean createTablespace(String tablespaceName, String containerPath, int initialSizePages) {
@@ -89,7 +95,7 @@ public class DatabaseSystem {
             
             if (created) {
                 // Create a buffer pool for this tablespace
-                BufferPoolManager bufferPoolManager = new BufferPoolManager(
+                IBufferPoolManager bufferPoolManager = new BufferPoolManager(
                         tablespaceName, 
                         storageManager, 
                         DEFAULT_BUFFER_POOL_SIZE);
@@ -124,73 +130,42 @@ public class DatabaseSystem {
         String containerPath = "./data/system_tablespace.dat";
         int initialSizePages = 100;
         
-        // Check if the tablespace already exists in the StorageManager
-        if (storageManager.getTablespace(systemTablespaceName) != null) {
-            logger.info("System tablespace already loaded in storage manager");
-            
-            // Make sure we have a buffer pool for it
-            if (!bufferPoolManagers.containsKey(systemTablespaceName)) {
-                BufferPoolManager bufferPoolManager = new BufferPoolManager(
-                        systemTablespaceName, 
-                        storageManager, 
-                        DEFAULT_BUFFER_POOL_SIZE);
+        try {
+            // Check if the tablespace already exists in the StorageManager
+            if (storageManager.getTablespace(systemTablespaceName) != null) {
+                logger.info("System tablespace already loaded in storage manager");
                 
-                bufferPoolManagers.put(systemTablespaceName, bufferPoolManager);
-                logger.info("Created buffer pool for existing system tablespace");
-            }
-            
-            return true;
-        }
-        
-        // Check if the tablespace file already exists
-        File containerFile = new File(containerPath);
-        boolean exists = containerFile.exists();
-        
-        if (exists) {
-            logger.info("System tablespace file exists, opening it");
-            try {
-                // Create the storage container
-                StorageContainer container = new StorageContainer(systemTablespaceName, containerPath, DEFAULT_PAGE_SIZE);
-                
-                // Create the tablespace
-                Tablespace tablespace = new Tablespace(systemTablespaceName, container);
-                boolean added = storageManager.addTablespace(tablespace);
-                
-                if (!added) {
-                    logger.error("Failed to add system tablespace to storage manager");
-                    return false;
+                // Make sure we have a buffer pool for it
+                if (!bufferPoolManagers.containsKey(systemTablespaceName)) {
+                    IBufferPoolManager bufferPoolManager = new BufferPoolManager(
+                            systemTablespaceName, 
+                            storageManager, 
+                            DEFAULT_BUFFER_POOL_SIZE);
+                    
+                    bufferPoolManagers.put(systemTablespaceName, bufferPoolManager);
+                    logger.info("Created buffer pool for existing system tablespace");
                 }
                 
-                // Create a buffer pool for this tablespace
-                BufferPoolManager bufferPoolManager = new BufferPoolManager(
-                        systemTablespaceName, 
-                        storageManager, 
-                        DEFAULT_BUFFER_POOL_SIZE);
-                
-                bufferPoolManagers.put(systemTablespaceName, bufferPoolManager);
-                logger.info("Successfully opened existing system tablespace");
                 return true;
-            } catch (Exception e) {
-                logger.error("Failed to open existing system tablespace", e);
-                
-                // If we can't open the existing file, it might be corrupted
-                // Attempt to delete and recreate it
-                logger.info("Attempting to recreate system tablespace");
-                containerFile.delete();
-                return createTablespace(systemTablespaceName, containerPath, initialSizePages);
             }
-        } else {
-            // Create a new system tablespace
-            logger.info("Creating new system tablespace at {}", containerPath);
+            
+            // Check if the tablespace file already exists
+            File containerFile = new File(containerPath);
+            boolean exists = containerFile.exists();
+            
+            // Create the tablespace
             boolean created = createTablespace(systemTablespaceName, containerPath, initialSizePages);
             
             if (created) {
-                logger.info("Successfully created new system tablespace");
-                return true;
+                logger.info("{} system tablespace '{}'", exists ? "Opened" : "Created", systemTablespaceName);
             } else {
-                logger.error("Failed to create new system tablespace");
-                return false;
+                logger.error("Failed to {} system tablespace '{}'", exists ? "open" : "create", systemTablespaceName);
             }
+            
+            return created;
+        } catch (Exception e) {
+            logger.error("Error creating system tablespace", e);
+            return false;
         }
     }
     
@@ -198,9 +173,9 @@ public class DatabaseSystem {
      * Gets the buffer pool manager for a specific tablespace.
      * 
      * @param tablespaceName The name of the tablespace
-     * @return The buffer pool manager
+     * @return The buffer pool manager, or null if not found
      */
-    public BufferPoolManager getBufferPoolManager(String tablespaceName) {
+    public IBufferPoolManager getBufferPoolManager(String tablespaceName) {
         return bufferPoolManagers.get(tablespaceName);
     }
     
@@ -238,9 +213,13 @@ public class DatabaseSystem {
         logger.info("Shutting down database system...");
         
         // Flush all buffer pools
-        for (BufferPoolManager bpm : bufferPoolManagers.values()) {
-            bpm.flushAll();
-            logger.info("Flushed buffer pool for tablespace '{}'", bpm.getTablespaceName());
+        for (IBufferPoolManager bpm : bufferPoolManagers.values()) {
+            try {
+                bpm.shutdown();
+                logger.info("Shut down buffer pool for tablespace '{}'", bpm.getTablespaceName());
+            } catch (Exception e) {
+                logger.error("Error shutting down buffer pool for tablespace '{}'", bpm.getTablespaceName(), e);
+            }
         }
         
         // Close storage manager

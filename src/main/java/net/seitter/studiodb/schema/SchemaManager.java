@@ -2,6 +2,7 @@ package net.seitter.studiodb.schema;
 
 import net.seitter.studiodb.DatabaseSystem;
 import net.seitter.studiodb.buffer.BufferPoolManager;
+import net.seitter.studiodb.buffer.IBufferPoolManager;
 import net.seitter.studiodb.storage.Page;
 import net.seitter.studiodb.storage.PageId;
 import org.slf4j.Logger;
@@ -71,7 +72,7 @@ public class SchemaManager {
     private boolean initializeSystemCatalog() {
         try {
             // Verify the system tablespace exists
-            BufferPoolManager systemBufferPool = dbSystem.getBufferPoolManager(SYSTEM_TABLESPACE);
+            IBufferPoolManager systemBufferPool = dbSystem.getBufferPoolManager(SYSTEM_TABLESPACE);
             if (systemBufferPool == null) {
                 logger.error("Cannot initialize system catalog: system tablespace not found");
                 return false;
@@ -228,7 +229,7 @@ public class SchemaManager {
             }
             
             // Allocate header page
-            BufferPoolManager bufferPool = dbSystem.getBufferPoolManager(SYSTEM_TABLESPACE);
+            IBufferPoolManager bufferPool = dbSystem.getBufferPoolManager(SYSTEM_TABLESPACE);
             
             if (bufferPool == null) {
                 logger.error("System tablespace does not exist");
@@ -287,7 +288,7 @@ public class SchemaManager {
             }
             
             // Verify the system buffer pool is available
-            BufferPoolManager systemBufferPool = dbSystem.getBufferPoolManager(SYSTEM_TABLESPACE);
+            IBufferPoolManager systemBufferPool = dbSystem.getBufferPoolManager(SYSTEM_TABLESPACE);
             if (systemBufferPool == null) {
                 logger.error("Cannot load schema from catalog: system buffer pool not available");
                 return;
@@ -484,16 +485,15 @@ public class SchemaManager {
     }
 
     /**
-     * Creates a new table with the specified columns.
+     * Creates a new table.
      *
      * @param tableName The name of the table
      * @param tablespaceName The name of the tablespace to store the table in
      * @param columns The columns of the table
      * @param primaryKeyColumns The names of the columns that form the primary key
-     * @return The created table, or null if creation failed
+     * @return The created table
      */
-    public Table createTable(String tableName, String tablespaceName, List<Column> columns, 
-                            List<String> primaryKeyColumns) {
+    public Table createTable(String tableName, String tablespaceName, List<Column> columns, List<String> primaryKeyColumns) {
         if (tables.containsKey(tableName)) {
             logger.warn("Table '{}' already exists", tableName);
             return null;
@@ -509,7 +509,7 @@ public class SchemaManager {
             }
             
             // Allocate header page
-            BufferPoolManager bufferPool = dbSystem.getBufferPoolManager(tablespaceName);
+            IBufferPoolManager bufferPool = dbSystem.getBufferPoolManager(tablespaceName);
             
             if (bufferPool == null) {
                 logger.error("Tablespace '{}' does not exist", tablespaceName);
@@ -611,29 +611,20 @@ public class SchemaManager {
      * @throws IOException If there's an error accessing the page
      */
     private void updateHeaderPageWithFirstDataPageId(PageId headerPageId, int firstDataPageId, 
-                                                    BufferPoolManager bufferPool) throws IOException {
+                                                    IBufferPoolManager bufferPool) throws IOException {
         Page headerPage = bufferPool.fetchPage(headerPageId);
-        ByteBuffer buffer = headerPage.getBuffer();
         
-        // Skip to the first data page ID field (at the end of the header page)
-        int magic = buffer.getInt(); // Magic number
-        int tableNameLength = buffer.getInt();
-        buffer.position(buffer.position() + tableNameLength * 2); // Skip table name (2 bytes per char)
-        
-        int numColumns = buffer.getInt();
-        for (int i = 0; i < numColumns; i++) {
-            int columnNameLength = buffer.getInt();
-            buffer.position(buffer.position() + columnNameLength * 2); // Skip column name
-            buffer.getInt(); // Data type
-            buffer.get(); // Nullable
-            buffer.getInt(); // Max length
+        if (headerPage == null) {
+            throw new IOException("Failed to fetch header page " + headerPageId);
         }
         
-        // Now at the first data page ID field
-        buffer.putInt(firstDataPageId);
-        
-        headerPage.markDirty();
-        bufferPool.unpinPage(headerPageId, true);
+        try {
+            ByteBuffer buffer = headerPage.getBuffer();
+            buffer.position(4); // Skip magic number
+            buffer.putInt(firstDataPageId);
+        } finally {
+            bufferPool.unpinPage(headerPage.getPageId(), true);
+        }
     }
     
     /**
@@ -700,7 +691,7 @@ public class SchemaManager {
             Index index = new Index(indexName, tableName, tablespaceName, columnNames, unique);
             
             // Allocate root page for the B-Tree
-            BufferPoolManager bufferPool = dbSystem.getBufferPoolManager(tablespaceName);
+            IBufferPoolManager bufferPool = dbSystem.getBufferPoolManager(tablespaceName);
             
             if (bufferPool == null) {
                 logger.error("Tablespace '{}' does not exist", tablespaceName);
@@ -886,26 +877,50 @@ public class SchemaManager {
     }
     
     /**
-     * Persists a tablespace's metadata to the system catalog.
+     * Persists tablespace information to the system catalog.
      *
      * @param tablespaceName The name of the tablespace
-     * @param containerPath The container path
-     * @param pageSize The page size
+     * @param containerPath The path to the tablespace file
+     * @param pageSize The page size in bytes
      */
     public void persistTablespaceToCatalog(String tablespaceName, String containerPath, int pageSize) {
         try {
-            // Insert into SYS_TABLESPACES
             Map<String, Object> tablespaceRow = new HashMap<>();
             tablespaceRow.put("TABLESPACE_NAME", tablespaceName);
             tablespaceRow.put("CONTAINER_PATH", containerPath);
             tablespaceRow.put("PAGE_SIZE", pageSize);
-            tablespaceRow.put("CREATION_TIME", System.currentTimeMillis());
+            tablespaceRow.put("CREATION_TIME", System.currentTimeMillis() / 1000);
             
             insertIntoSystemTable(SYS_TABLESPACES, tablespaceRow);
-            
-            logger.debug("Persisted tablespace '{}' to system catalog", tablespaceName);
+            logger.info("Persisted tablespace '{}' to system catalog", tablespaceName);
         } catch (Exception e) {
             logger.error("Failed to persist tablespace '{}' to system catalog", tablespaceName, e);
+        }
+    }
+
+    /**
+     * Allocates and initializes storage for a new table.
+     *
+     * @param tableName The name of the table
+     * @param tablespaceName The name of the tablespace to store the table in
+     * @param columnCount The number of columns in the table
+     * @return The created table
+     */
+    public Table createTableStorage(String tableName, String tablespaceName, int columnCount) {
+        try {
+            IBufferPoolManager bufferPool = dbSystem.getBufferPoolManager(tablespaceName);
+            
+            if (bufferPool == null) {
+                logger.error("Tablespace '{}' does not exist", tablespaceName);
+                return null;
+            }
+            
+            // Implementation of createTableStorage method
+            // This method should return the created table
+            return null; // Placeholder return, actual implementation needed
+        } catch (Exception e) {
+            logger.error("Failed to create table storage for '{}'", tableName, e);
+            return null;
         }
     }
 } 
