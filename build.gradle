@@ -111,9 +111,9 @@ task copyReactApp(type: Copy) {
 }
 
 // Make the build task depend on copyReactApp if web-ui exists
-tasks.whenTaskAdded { task ->
-    if (task.name == 'processResources' && file("${project.projectDir}/web-ui").exists()) {
-        task.dependsOn(copyReactApp)
+tasks.named('processResources') {
+    if (file("${project.projectDir}/web-ui").exists()) {
+        dependsOn(copyReactApp)
     }
 }
 
@@ -127,9 +127,34 @@ task runWithViz(type: JavaExec) {
     args = ['--viz']
 }
 
+// Configure task dependencies
+tasks.named('distTar') {
+    dependsOn tasks.named('shadowJar')
+}
+
+tasks.named('distZip') {
+    dependsOn tasks.named('shadowJar')
+}
+
+tasks.named('startScripts') {
+    dependsOn tasks.named('shadowJar')
+}
+
+tasks.named('startShadowScripts') {
+    dependsOn tasks.named('jar')
+}
+
+tasks.named('shadowDistTar') {
+    dependsOn tasks.named('jar')
+}
+
+tasks.named('shadowDistZip') {
+    dependsOn tasks.named('jar')
+}
+
 // Make the build task depend on shadowJar
-build {
-    dependsOn shadowJar
+tasks.named('build') {
+    dependsOn tasks.named('shadowJar')
 }
 
 test {
