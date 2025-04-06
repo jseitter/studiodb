@@ -156,7 +156,7 @@ public class StorageSystemTest {
         int freeSpaceOffset = dataBuffer.getInt();
         
         // If this is a new page, initialize free space
-        if (freeSpaceOffset == 0) {
+        if (freeSpaceOffset == 16) {
             freeSpaceOffset = dataBuffer.capacity();
         }
         

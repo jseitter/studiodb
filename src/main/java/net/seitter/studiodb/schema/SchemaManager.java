@@ -451,11 +451,113 @@ public class SchemaManager {
      * @param row The row to insert
      */
     private void insertIntoSystemTable(String tableName, Map<String, Object> row) {
-        // For now, we're just defining the interface
-        // The actual implementation would involve writing to the system tables
-        
-        // This would be completed in a future implementation
-        logger.debug("Inserting into system table {} not fully implemented yet", tableName);
+        try {
+            // Get the table object
+            Table table = tables.get(tableName);
+            if (table == null) {
+                logger.error("Cannot insert into table '{}': table not found", tableName);
+                return;
+            }
+            
+            // Get the buffer pool for the system tablespace
+            IBufferPoolManager bufferPool = dbSystem.getBufferPoolManager(SYSTEM_TABLESPACE);
+            if (bufferPool == null) {
+                logger.error("Cannot insert into table '{}': buffer pool for system tablespace not found", tableName);
+                return;
+            }
+            
+            // Get the header page
+            PageId headerPageId = new PageId(SYSTEM_TABLESPACE, table.getHeaderPageId());
+            Page headerPage = bufferPool.fetchPage(headerPageId);
+            if (headerPage == null) {
+                logger.error("Cannot insert into table '{}': header page not found", tableName);
+                bufferPool.unpinPage(headerPageId, false);
+                return;
+            }
+            
+            // Get the first data page ID
+            ByteBuffer headerBuffer = headerPage.getBuffer();
+            headerBuffer.position(4); // Skip magic number
+            int firstDataPageId = headerBuffer.getInt();
+            bufferPool.unpinPage(headerPageId, false);
+            
+            // Get the data page
+            PageId dataPageId = new PageId(SYSTEM_TABLESPACE, firstDataPageId);
+            Page dataPage = bufferPool.fetchPage(dataPageId);
+            if (dataPage == null) {
+                logger.error("Cannot insert into table '{}': data page not found", tableName);
+                return;
+            }
+            
+            try {
+                // Serialize the row data
+                byte[] rowData = serializeRow(row);
+                
+                // Read current row count and free space offset
+                ByteBuffer dataBuffer = dataPage.getBuffer();
+                dataBuffer.position(8); // Skip magic and next page ID
+                int rowCount = dataBuffer.getInt();
+                int freeSpaceOffset = dataBuffer.getInt();
+                
+                // If this is a new page, initialize free space
+                if (freeSpaceOffset == 16) {
+                    freeSpaceOffset = dataBuffer.capacity();
+                }
+                
+                // Store row from end of page backward
+                int newRowOffset = freeSpaceOffset - rowData.length;
+                int rowDirectoryPos = 16 + rowCount * 8;
+                
+                // Check if we have enough space
+                if (rowDirectoryPos + 8 >= newRowOffset) {
+                    logger.error("Cannot insert into table '{}': not enough space in data page", tableName);
+                    bufferPool.unpinPage(dataPageId, false);
+                    return;
+                }
+                
+                // Update directory
+                dataBuffer.position(rowDirectoryPos);
+                dataBuffer.putInt(newRowOffset);
+                dataBuffer.putInt(rowData.length);
+                
+                // Write row data
+                dataBuffer.position(newRowOffset);
+                dataBuffer.put(rowData);
+                
+                // Update metadata
+                dataBuffer.position(8);
+                dataBuffer.putInt(rowCount + 1);
+                dataBuffer.putInt(newRowOffset);
+                
+                // Mark page as dirty
+                dataPage.markDirty();
+                
+                // Force flush all pages to ensure they are written to disk
+                try {
+                    bufferPool.flushAll();
+                } catch (IOException e) {
+                    logger.error("Error flushing buffer pool after inserting into table '{}'", tableName, e);
+                }
+                
+                logger.debug("Inserted row into system table '{}'", tableName);
+            } finally {
+                // Unpin the data page
+                bufferPool.unpinPage(dataPageId, true);
+            }
+        } catch (Exception e) {
+            logger.error("Failed to insert into system table '{}'", tableName, e);
+        }
+    }
+    
+    /**
+     * Serializes a row into a byte array.
+     *
+     * @param row The row to serialize
+     * @return The serialized row as a byte array
+     */
+    private byte[] serializeRow(Map<String, Object> row) throws IOException {
+        com.fasterxml.jackson.databind.ObjectMapper mapper = new com.fasterxml.jackson.databind.ObjectMapper();
+        return mapper.writeValueAsBytes(row);
     }
     
     /**
