@@ -21,6 +21,11 @@ dependencies {
     implementation 'com.google.guava:guava:31.0.1-jre'
     implementation 'org.antlr:antlr4-runtime:4.9.3'
     
+    // JLine console dependencies
+    implementation 'org.jline:jline-terminal:3.21.0'
+    implementation 'org.jline:jline-reader:3.21.0'
+    implementation 'org.jline:jline-terminal-jansi:3.21.0' // For Windows support
+    
     // Web server dependencies
     implementation 'io.javalin:javalin:5.6.3'
     implementation 'org.webjars.npm:swagger-ui-dist:5.10.0'
