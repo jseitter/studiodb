@@ -134,6 +134,80 @@ DATE                           Date value (YYYY-MM-DD)
 - `sql`: SQL parser and execution engine
 - `utils`: Utility classes
 
+## Storage Container Format
+
+StudioDB uses a page-based storage architecture with the following key components:
+
+### Storage Container
+
+A storage container is a physical file on disk that holds a tablespace's data. The file is divided into fixed-size pages (typically 4KB each). Key characteristics:
+
+- Each container belongs to a specific tablespace
+- Pages are addressed by a zero-based page number
+- The file grows automatically as new pages are allocated
+- Container format is simple and consists entirely of pages
+
+### Page Structure
+
+All pages have a common structure with page-specific headers:
+
+- **Page ID**: A combination of tablespace name and page number
+- **Fixed Size**: All pages have the same size (default 4KB)
+- **Magic Number**: 4-byte identifier at the start of each page to identify its type
+
+### Table Header Page (Magic Number: 0xDADA0101)
+
+Stores the table's metadata:
+
+```
+[Magic Number (4 bytes)]
+[First Data Page ID (4 bytes)]
+[Table Name Length (4 bytes)]
+[Table Name (variable)]
+[Number of Columns (4 bytes)]
+[Column Definitions...]
+```
+
+Each column definition:
+```
+[Name Length (4 bytes)]
+[Name (variable)]
+[Data Type (4 bytes)]
+[Nullable Flag (1 byte)]
+[Max Length (4 bytes)]
+```
+
+### Table Data Page (Magic Number: 0xDADA0201)
+
+Stores the actual row data:
+
+```
+[Magic Number (4 bytes)]
+[Next Page ID (4 bytes)]
+[Number of Rows (4 bytes)]
+[Free Space Offset (4 bytes)]
+[Row Directory...]
+[Row Data...]
+```
+
+Row directory is an array of (offset, length) pairs pointing to the actual row data:
+```
+[Row Offset (4 bytes)]
+[Row Length (4 bytes)]
+```
+
+Rows are stored from the end of the page backward, while the row directory grows from the beginning forward. When the free space between them is exhausted, new rows are allocated on a new page.
+
+### System Catalog
+
+StudioDB maintains a set of system tables stored in the SYSTEM tablespace:
+
+- **SYS_TABLESPACES**: Stores information about tablespaces
+- **SYS_TABLES**: Stores information about tables
+- **SYS_COLUMNS**: Stores information about table columns
+- **SYS_INDEXES**: Stores information about indexes
+- **SYS_INDEX_COLUMNS**: Stores information about index columns
+
 ## Educational Purpose
 
 This project is specifically designed to illustrate database internals and is not intended for production use. It prioritizes clarity of concepts over performance or feature completeness. 
