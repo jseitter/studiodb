@@ -36,20 +36,30 @@ public class DatabaseSystem {
         this.storageManager = new StorageManager(DEFAULT_PAGE_SIZE);
         this.bufferPoolManagers = new HashMap<>();
         
-        // Create system tablespace first
+        // Initialize system tablespace first
         boolean systemTablespaceCreated = false;
+        String systemTablespaceName = "SYSTEM";
         String systemTablespacePath = "./data/system_tablespace.dat";
+        int initialSizePages = 100;
+        
         try {
-            boolean created = createSystemTablespace();
+            // Check if system tablespace file exists
+            File systemTablespaceFile = new File(systemTablespacePath);
+            boolean exists = systemTablespaceFile.exists();
+            
+            // Create or open the system tablespace
+            boolean created = createTablespace(systemTablespaceName, systemTablespacePath, initialSizePages);
+            
             if (!created) {
-                logger.error("Failed to create or open system tablespace");
+                logger.error("Failed to {} system tablespace", exists ? "open" : "create");
             } else {
-                systemTablespaceCreated = true;
+                logger.info("{} system tablespace successfully", exists ? "Opened" : "Created");
+                systemTablespaceCreated = !exists; // Only mark as created if it didn't exist before
             }
         } catch (Exception e) {
             logger.error("Error initializing system tablespace", e);
         }
-        
+       // Initialize schema manager
         this.schemaManager = new SchemaManager(this);
         
         // Now that schema manager is initialized, persist system tablespace info if it was newly created
@@ -91,6 +101,26 @@ public class DatabaseSystem {
      */
     public boolean createTablespace(String tablespaceName, String containerPath, int initialSizePages) {
         try {
+            // Check if the tablespace file already exists
+            File containerFile = new File(containerPath);
+            boolean exists = containerFile.exists();
+            
+            // Check if the tablespace is already loaded in the storage manager
+            if (storageManager.getTablespace(tablespaceName) != null) {
+                // Tablespace is already loaded, just ensure we have a buffer pool for it
+                if (!bufferPoolManagers.containsKey(tablespaceName)) {
+                    IBufferPoolManager bufferPoolManager = new BufferPoolManager(
+                            tablespaceName, 
+                            storageManager, 
+                            DEFAULT_BUFFER_POOL_SIZE);
+                    
+                    bufferPoolManagers.put(tablespaceName, bufferPoolManager);
+                    logger.info("Created buffer pool for existing tablespace '{}'", tablespaceName);
+                }
+                
+                return true;
+            }
+            
             boolean created = storageManager.createTablespace(tablespaceName, containerPath, initialSizePages);
             
             if (created) {
@@ -101,70 +131,23 @@ public class DatabaseSystem {
                         DEFAULT_BUFFER_POOL_SIZE);
                 
                 bufferPoolManagers.put(tablespaceName, bufferPoolManager);
-                logger.info("Created tablespace '{}' with buffer pool of {} pages", 
-                        tablespaceName, DEFAULT_BUFFER_POOL_SIZE);
+                logger.info("{} tablespace '{}' with buffer pool of {} pages", 
+                        exists ? "Opened" : "Created", tablespaceName, DEFAULT_BUFFER_POOL_SIZE);
                 
-                // Persist tablespace information to system catalog
-                if (schemaManager != null) {
+                // Persist tablespace information to system catalog if this isn't the system tablespace
+                // (System tablespace is handled specially in the constructor)
+                if (schemaManager != null && !tablespaceName.equals("SYSTEM")) {
                     schemaManager.persistTablespaceToCatalog(tablespaceName, containerPath, DEFAULT_PAGE_SIZE);
                     logger.info("Persisted tablespace '{}' information to system catalog", tablespaceName);
-                } else {
+                } else if (!tablespaceName.equals("SYSTEM")) {
                     logger.warn("Schema manager is not initialized, cannot persist tablespace information");
                 }
             }
             
             return created;
         } catch (Exception e) {
-            logger.error("Failed to create tablespace '{}'", tablespaceName, e);
-            return false;
-        }
-    }
-    
-    /**
-     * Creates or opens the system tablespace where catalog tables are stored.
-     * 
-     * @return true if creation was successful or if it already exists
-     */
-    private boolean createSystemTablespace() {
-        String systemTablespaceName = "SYSTEM";
-        String containerPath = "./data/system_tablespace.dat";
-        int initialSizePages = 100;
-        
-        try {
-            // Check if the tablespace already exists in the StorageManager
-            if (storageManager.getTablespace(systemTablespaceName) != null) {
-                logger.info("System tablespace already loaded in storage manager");
-                
-                // Make sure we have a buffer pool for it
-                if (!bufferPoolManagers.containsKey(systemTablespaceName)) {
-                    IBufferPoolManager bufferPoolManager = new BufferPoolManager(
-                            systemTablespaceName, 
-                            storageManager, 
-                            DEFAULT_BUFFER_POOL_SIZE);
-                    
-                    bufferPoolManagers.put(systemTablespaceName, bufferPoolManager);
-                    logger.info("Created buffer pool for existing system tablespace");
-                }
-                
-                return true;
-            }
-            
-            // Check if the tablespace file already exists
-            File containerFile = new File(containerPath);
-            boolean exists = containerFile.exists();
-            
-            // Create the tablespace
-            boolean created = createTablespace(systemTablespaceName, containerPath, initialSizePages);
-            
-            if (created) {
-                logger.info("{} system tablespace '{}'", exists ? "Opened" : "Created", systemTablespaceName);
-            } else {
-                logger.error("Failed to {} system tablespace '{}'", exists ? "open" : "create", systemTablespaceName);
-            }
-            
-            return created;
-        } catch (Exception e) {
-            logger.error("Error creating system tablespace", e);
+            logger.error("Failed to {} tablespace '{}'", 
+                    new File(containerPath).exists() ? "open" : "create", tablespaceName, e);
             return false;
         }
     }
