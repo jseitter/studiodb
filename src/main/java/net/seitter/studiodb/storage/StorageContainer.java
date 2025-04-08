@@ -9,6 +9,8 @@ import java.io.RandomAccessFile;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 
+import net.seitter.studiodb.schema.SchemaManager;
+
 /**
  * Represents a physical storage container for a tablespace.
  * Handles low-level read and write operations to the underlying file.
@@ -63,6 +65,9 @@ public class StorageContainer {
             throws IOException {
         this(tablespaceName, containerPath, pageSize);
         
+        // Check if this is a new file
+        boolean isNewFile = file.length() == 0;
+        
         // Preallocate space
         if (initialSizePages > 0) {
             long initialSizeBytes = (long) initialSizePages * pageSize;
@@ -70,6 +75,52 @@ public class StorageContainer {
             logger.info("Preallocated {} pages ({} bytes) for tablespace '{}'", 
                     initialSizePages, initialSizeBytes, tablespaceName);
         }
+        
+        // Initialize page 0 as a container metadata page for new containers
+        if (isNewFile && initialSizePages > 0) {
+            initializeContainerMetadataPage();
+            logger.info("Initialized container metadata page for tablespace '{}'", tablespaceName);
+        }
+    }
+    
+    /**
+     * Initializes page 0 as a container metadata page.
+     * This page contains information about the container itself.
+     *
+     * @throws IOException If there's an error writing the page
+     */
+    private void initializeContainerMetadataPage() throws IOException {
+        PageId metadataPageId = new PageId(tablespaceName, 0);
+        Page metadataPage = new Page(metadataPageId, pageSize);
+        ByteBuffer buffer = metadataPage.getBuffer();
+        
+        // Write container metadata
+        // [Page Type (1 byte)] [Magic Number (4 bytes)] [Tablespace Name Length (2 bytes)] [Tablespace Name (variable)]
+        // [Page Size (4 bytes)] [Creation Time (8 bytes)] [Total Pages (4 bytes)]
+        
+        // Write page type marker
+        buffer.put((byte) SchemaManager.PAGE_TYPE_FREE_SPACE_MAP);
+        
+        // Write magic number for container metadata
+        buffer.putInt(SchemaManager.MAGIC_CONTAINER_METADATA);
+        
+        // Write tablespace name
+        buffer.putShort((short) tablespaceName.length());
+        for (int i = 0; i < tablespaceName.length(); i++) {
+            buffer.putChar(tablespaceName.charAt(i));
+        }
+        
+        // Write page size
+        buffer.putInt(pageSize);
+        
+        // Write creation time (current time in milliseconds)
+        buffer.putLong(System.currentTimeMillis());
+        
+        // Write total pages
+        buffer.putInt(getTotalPages());
+        
+        // Write the page to disk
+        writePage(metadataPage);
     }
     
     /**
@@ -140,15 +191,46 @@ public class StorageContainer {
      * @throws IOException If there's an error allocating the page
      */
     public Page allocatePage() throws IOException {
-        int pageNumber = (int) (file.length() / pageSize);
-        PageId pageId = new PageId(tablespaceName, pageNumber);
+        // Find the next available page (starting from page 1)
+        int nextPageNumber = findNextAvailablePage();
+        
+        // Create a new page
+        PageId pageId = new PageId(tablespaceName, nextPageNumber);
         Page page = new Page(pageId, pageSize);
         
         // Write the blank page to disk to allocate the space
         writePage(page);
         
-        logger.debug("Allocated new page {} in tablespace '{}'", pageNumber, tablespaceName);
+        logger.debug("Allocated new page {} in tablespace '{}'", nextPageNumber, tablespaceName);
         return page;
+    }
+    
+    /**
+     * Finds the next available page number for allocation.
+     * Starts from page 1 (page 0 is reserved for container metadata).
+     *
+     * @return The next available page number
+     * @throws IOException If there's an error accessing the file
+     */
+    private int findNextAvailablePage() throws IOException {
+        int totalPages = getTotalPages();
+        
+        // If the file is empty or has only one page (metadata), return page 1
+        if (totalPages <= 1) {
+            // Ensure we have at least 2 pages (0 for metadata, 1 for first data page)
+            long minLength = 2L * pageSize;
+            if (file.length() < minLength) {
+                file.setLength(minLength);
+            }
+            return 1;
+        }
+        
+        // If we already have more pages, find the first unallocated page
+        // For simplicity in this educational system, we'll just use the next page number
+        return totalPages;
+        
+        // In a real system, we would maintain a free space map to track available pages
+        // and possibly reuse pages that have been deallocated.
     }
     
     /**
@@ -193,11 +275,13 @@ public class StorageContainer {
      */
     public void close() {
         try {
+            //
             if (channel != null && channel.isOpen()) {
                 channel.force(true);
                 channel.close();
             }
             
+            // close the file
             if (file != null) {
                 file.close();
             }

@@ -11,8 +11,10 @@ import java.io.IOException;
  */
 public class Tablespace {
     private static final Logger logger = LoggerFactory.getLogger(Tablespace.class);
-    
+   
+    // name of the tablespace
     private final String name;
+    // for now we only support a single storage container per tablespace
     private final StorageContainer storageContainer;
     
     /**

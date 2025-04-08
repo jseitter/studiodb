@@ -27,12 +27,36 @@ public class SchemaManager {
     private final Map<String, List<Index>> tableIndexes;
     
     // System catalog table names
-    private static final String SYSTEM_TABLESPACE = "SYSTEM";
-    private static final String SYS_TABLESPACES = "SYS_TABLESPACES";
-    private static final String SYS_TABLES = "SYS_TABLES";
-    private static final String SYS_COLUMNS = "SYS_COLUMNS";
-    private static final String SYS_INDEXES = "SYS_INDEXES";
-    private static final String SYS_INDEX_COLUMNS = "SYS_INDEX_COLUMNS";
+    public static final String SYSTEM_TABLESPACE = "SYSTEM";
+    public static final String SYS_TABLESPACES = "SYS_TABLESPACES";
+    public static final String SYS_TABLES = "SYS_TABLES";
+    public static final String SYS_COLUMNS = "SYS_COLUMNS";
+    public static final String SYS_INDEXES = "SYS_INDEXES";
+    public static final String SYS_INDEX_COLUMNS = "SYS_INDEX_COLUMNS";
+    
+    // Page type magic numbers
+    public static final int PAGE_TYPE_UNUSED = 0;
+    public static final int PAGE_TYPE_TABLE_HEADER = 1;
+    public static final int PAGE_TYPE_TABLE_DATA = 2;
+    public static final int PAGE_TYPE_INDEX_HEADER = 3;
+    public static final int PAGE_TYPE_INDEX_INTERNAL = 4;
+    public static final int PAGE_TYPE_INDEX_LEAF = 5;
+    public static final int PAGE_TYPE_SYSTEM_CATALOG = 6;
+    public static final int PAGE_TYPE_FREE_SPACE_MAP = 7;
+    public static final int PAGE_TYPE_TRANSACTION_LOG = 8;
+    
+    // Page header magic numbers
+    public static final int MAGIC_TABLE_HEADER = 0xDADA0101;
+    public static final int MAGIC_TABLE_DATA = 0xDADA0201;
+    public static final int MAGIC_BTREE_PAGE = 0xDADA0301;
+    public static final int MAGIC_CONTAINER_METADATA = 0xDADA0001;
+    
+    // System catalog type identifiers
+    public static final int CATALOG_TYPE_TABLESPACES = 1;
+    public static final int CATALOG_TYPE_TABLES = 2;
+    public static final int CATALOG_TYPE_COLUMNS = 3;
+    public static final int CATALOG_TYPE_INDEXES = 4;
+    public static final int CATALOG_TYPE_INDEX_COLUMNS = 5;
     
     /**
      * Creates a new schema manager.
@@ -257,7 +281,9 @@ public class SchemaManager {
             
             // Update the header page with the first data page ID
             updateHeaderPageWithFirstDataPageId(headerPage.getPageId(), table.getFirstDataPageId(), bufferPool);
-            
+            // flush all pages to disk
+            bufferPool.flushAll();
+
             // Store the table in our schema
             tables.put(tableName, table);
             tableIndexes.put(tableName, new ArrayList<>());
@@ -666,40 +692,44 @@ public class SchemaManager {
         ByteBuffer buffer = headerPage.getBuffer();
         
         // Basic format of the header page:
-        // [Magic Number (4 bytes)] [Table Name Length (4 bytes)] [Table Name (variable)]
-        // [Number of Columns (4 bytes)] [Column Definitions...] [First Data Page ID (4 bytes)]
+        // [Page Type (1 byte)] [Magic Number (4 bytes)] [First Data Page ID (4 bytes)]
+        // [Table Name Length (2 bytes)] [Table Name (variable)]
+        // [Number of Columns (2 bytes)] [Column Definitions...]
+        
+        // Write page type marker
+        buffer.put((byte) PAGE_TYPE_TABLE_HEADER);
         
         // Write magic number
-        buffer.putInt(0xDADA0101); // Magic number for table header page
+        buffer.putInt(MAGIC_TABLE_HEADER);
+        
+        // Reserve space for first data page ID (will be updated later)
+        buffer.putInt(-1);
         
         // Write table name
         String tableName = table.getName();
-        buffer.putInt(tableName.length());
+        buffer.putShort((short) tableName.length());
         for (int i = 0; i < tableName.length(); i++) {
             buffer.putChar(tableName.charAt(i));
         }
         
         // Write number of columns
         List<Column> columns = table.getColumns();
-        buffer.putInt(columns.size());
+        buffer.putShort((short) columns.size());
         
         // Write column definitions
         for (Column column : columns) {
-            // Column format: [Name Length (4 bytes)] [Name (variable)] [Data Type (4 bytes)]
+            // Column format: [Name Length (2 bytes)] [Name (variable)] [Data Type (1 byte)]
             // [Nullable (1 byte)] [Max Length (4 bytes)]
             String columnName = column.getName();
-            buffer.putInt(columnName.length());
+            buffer.putShort((short) columnName.length());
             for (int i = 0; i < columnName.length(); i++) {
                 buffer.putChar(columnName.charAt(i));
             }
             
-            buffer.putInt(column.getDataType().ordinal());
+            buffer.put((byte) column.getDataType().ordinal());
             buffer.put(column.isNullable() ? (byte) 1 : (byte) 0);
             buffer.putInt(column.getMaxLength());
         }
-        
-        // Space for first data page ID (will be updated later)
-        buffer.putInt(-1);
         
         headerPage.markDirty();
     }
@@ -722,8 +752,10 @@ public class SchemaManager {
         
         try {
             ByteBuffer buffer = headerPage.getBuffer();
-            buffer.position(4); // Skip magic number
+            // Skip page type and magic number
+            buffer.position(5);
             buffer.putInt(firstDataPageId);
+            headerPage.markDirty();
         } finally {
             bufferPool.unpinPage(headerPage.getPageId(), true);
         }
@@ -738,20 +770,26 @@ public class SchemaManager {
         ByteBuffer buffer = dataPage.getBuffer();
         
         // Basic format of a data page:
-        // [Magic Number (4 bytes)] [Next Page ID (4 bytes)] [Number of Rows (4 bytes)]
-        // [Free Space Offset (4 bytes)] [Row Directory...] [Row Data...]
+        // [Page Type (1 byte)] [Magic Number (4 bytes)] [Next Page ID (4 bytes)] [Prev Page ID (4 bytes)]
+        // [Number of Rows (2 bytes)] [Free Space Offset (2 bytes)] [Row Directory...] [Row Data...]
+        
+        // Write page type marker
+        buffer.put((byte) PAGE_TYPE_TABLE_DATA);
         
         // Write magic number
-        buffer.putInt(0xDADA0201); // Magic number for table data page
+        buffer.putInt(MAGIC_TABLE_DATA);
         
         // No next page yet
         buffer.putInt(-1);
         
+        // No previous page yet
+        buffer.putInt(-1);
+        
         // No rows yet
-        buffer.putInt(0);
+        buffer.putShort((short) 0);
         
         // Free space starts after the header
-        buffer.putInt(16); // 4 (magic) + 4 (next page) + 4 (num rows) + 4 (free space offset)
+        buffer.putShort((short) 15); // 1 (type) + 4 (magic) + 4 (next) + 4 (prev) + 2 (rows) + 2 (free space offset) - starting from 0
         
         dataPage.markDirty();
     }
@@ -838,23 +876,26 @@ public class SchemaManager {
         ByteBuffer buffer = rootPage.getBuffer();
         
         // Basic format of a B-Tree page:
-        // [Magic Number (4 bytes)] [Is Leaf (1 byte)] [Number of Keys (4 bytes)]
-        // [Key Type (4 bytes)] [Key Entries...] [Child Pointers...]
+        // [Page Type (1 byte)] [Magic Number (4 bytes)] [Is Leaf (1 byte)] [Number of Keys (2 bytes)]
+        // [Key Type (1 byte)] [Key Entries...] [Child Pointers...]
+        
+        // Write page type marker (leaf B-tree page initially)
+        buffer.put((byte) PAGE_TYPE_INDEX_LEAF);
         
         // Write magic number
-        buffer.putInt(0xDADA0301); // Magic number for B-Tree page
+        buffer.putInt(MAGIC_BTREE_PAGE);
         
         // This is a leaf node (initially)
         buffer.put((byte) 1);
         
         // No keys yet
-        buffer.putInt(0);
+        buffer.putShort((short) 0);
         
         // Store the key type based on the first indexed column
         Table table = tables.get(index.getTableName());
         String firstColumnName = index.getColumnNames().get(0);
         Column firstColumn = table.getColumn(firstColumnName);
-        buffer.putInt(firstColumn.getDataType().ordinal());
+        buffer.put((byte) firstColumn.getDataType().ordinal());
         
         rootPage.markDirty();
     }

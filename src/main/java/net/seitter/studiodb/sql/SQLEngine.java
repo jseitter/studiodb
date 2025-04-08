@@ -15,6 +15,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
+import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
@@ -901,149 +902,330 @@ public class SQLEngine {
     
     /**
      * Determine the type of page based on its contents.
-     * This is a placeholder method - in a real implementation, this would analyze
-     * the page data according to your database's internal page format.
+     * Analyzes page header data to identify the page type.
      *
      * @param data The page data
      * @return The page type as a string
      */
     private String determinePageType(byte[] data) {
-        // This is a simplified implementation
-        // In a real system, you would examine header bytes or other markers
-        
-        // Check first few bytes to determine type
-        if (data.length < 4) {
+        if (data.length < 5) { // Need at least page type and magic number
             return "EMPTY";
         }
         
-        // Simple logic to determine page type based on first byte
-        // This should be replaced with actual page type detection logic
+        // First byte is our page type marker
         int typeMarker = data[0] & 0xFF;
         
-        if (typeMarker == 0) {
-            return "FREE";
-        } else if (typeMarker == 1) {
-            return "DATA";
-        } else if (typeMarker == 2) {
-            return "INDEX";
-        } else if (typeMarker == 3) {
-            return "DIRECTORY";
-        } else if (typeMarker == 4) {
-            return "METADATA";
-        } else {
-            return "UNKNOWN";
+        // Verify magic number to confirm page type (first 4 bytes after the type marker)
+        int magic = ByteBuffer.wrap(data, 1, 4).getInt();
+        
+        // Check if magic number matches the expected value for the page type
+        switch (typeMarker) {
+            case SchemaManager.PAGE_TYPE_TABLE_HEADER:
+                return (magic == SchemaManager.MAGIC_TABLE_HEADER) ? "TABLE_HEADER" : "CORRUPT";
+            
+            case SchemaManager.PAGE_TYPE_TABLE_DATA:
+                return (magic == SchemaManager.MAGIC_TABLE_DATA) ? "TABLE_DATA" : "CORRUPT";
+            
+            case SchemaManager.PAGE_TYPE_INDEX_HEADER:
+            case SchemaManager.PAGE_TYPE_INDEX_INTERNAL:
+            case SchemaManager.PAGE_TYPE_INDEX_LEAF:
+                return (magic == SchemaManager.MAGIC_BTREE_PAGE) ? 
+                    (typeMarker == SchemaManager.PAGE_TYPE_INDEX_HEADER ? "INDEX_HEADER" :
+                     typeMarker == SchemaManager.PAGE_TYPE_INDEX_INTERNAL ? "INDEX_INTERNAL" : "INDEX_LEAF") 
+                    : "CORRUPT";
+            
+            case SchemaManager.PAGE_TYPE_SYSTEM_CATALOG:
+                return "SYSTEM_CATALOG";
+            
+            case SchemaManager.PAGE_TYPE_FREE_SPACE_MAP:
+                return (magic == SchemaManager.MAGIC_CONTAINER_METADATA) ? "FREE_SPACE_MAP" : "CORRUPT";
+            
+            case SchemaManager.PAGE_TYPE_TRANSACTION_LOG:
+                return "TRANSACTION_LOG";
+            
+            case SchemaManager.PAGE_TYPE_UNUSED:
+                return "UNUSED";
+            
+            default:
+                return "UNKNOWN";
         }
     }
     
     /**
      * Get the next page pointer from a page.
-     * This is a placeholder method - in a real implementation, this would read
-     * the next page pointer according to your database's internal page format.
+     * Reads the next page pointer from the page header.
      *
      * @param data The page data
      * @return The next page number, or -1 if none
      */
     private int getNextPagePointer(byte[] data) {
-        // This is a simplified implementation
-        // In a real system, you would read a specific location in the page header
-        
-        if (data.length < 8) {
+        if (data.length < 9) { // Need page type (1) + magic number (4) + next page pointer (4)
             return -1;
         }
         
-        // Simple example: assuming next page pointer is at bytes 4-7
-        return ((data[4] & 0xFF) << 24) | 
-               ((data[5] & 0xFF) << 16) | 
-               ((data[6] & 0xFF) << 8) | 
-                (data[7] & 0xFF);
+        // Next page pointer location depends on page type
+        int typeMarker = data[0] & 0xFF;
+        
+        switch (typeMarker) {
+            case SchemaManager.PAGE_TYPE_TABLE_HEADER:
+                // Next page is first data page, at offset 5
+                return ByteBuffer.wrap(data, 5, 4).getInt();
+            
+            case SchemaManager.PAGE_TYPE_TABLE_DATA:
+                // Next page pointer is at offset 5 (after page type and magic)
+                return ByteBuffer.wrap(data, 5, 4).getInt();
+            
+            default:
+                return -1; // Other page types don't have standard next page pointers
+        }
     }
     
     /**
      * Get the previous page pointer from a page.
-     * This is a placeholder method - in a real implementation, this would read
-     * the previous page pointer according to your database's internal page format.
+     * Reads the previous page pointer from the page header.
      *
      * @param data The page data
      * @return The previous page number, or -1 if none
      */
     private int getPrevPagePointer(byte[] data) {
-        // This is a simplified implementation
-        // In a real system, you would read a specific location in the page header
-        
-        if (data.length < 12) {
+        if (data.length < 13) { // Need page type (1) + magic (4) + next page (4) + prev page (4)
             return -1;
         }
         
-        // Simple example: assuming prev page pointer is at bytes 8-11
-        return ((data[8] & 0xFF) << 24) | 
-               ((data[9] & 0xFF) << 16) | 
-               ((data[10] & 0xFF) << 8) | 
-                (data[11] & 0xFF);
+        // Previous page pointer location depends on page type
+        int typeMarker = data[0] & 0xFF;
+        
+        switch (typeMarker) {
+            case SchemaManager.PAGE_TYPE_TABLE_DATA:
+                // Previous page pointer is at offset 9 (after page type, magic, and next page)
+                return ByteBuffer.wrap(data, 9, 4).getInt();
+            
+            default:
+                return -1; // Other page types don't have standard prev page pointers
+        }
     }
     
     /**
      * Calculate the free space in a page.
-     * This is a placeholder method - in a real implementation, this would calculate
-     * free space according to your database's internal page format.
+     * Reads the free space pointer from the page header.
      *
      * @param data The page data
      * @param pageSize The total size of the page
      * @return The amount of free space in bytes
      */
     private int calculateFreeSpace(byte[] data, int pageSize) {
-        // This is a simplified implementation
-        // In a real system, you would read the free space pointer or calculate based on used space
-        
         if (data.length < 16) {
             return pageSize;
         }
         
-        // Simple example: assuming free space pointer is at bytes 12-15
-        int usedSpace = ((data[12] & 0xFF) << 24) | 
-                         ((data[13] & 0xFF) << 16) | 
-                         ((data[14] & 0xFF) << 8) | 
-                          (data[15] & 0xFF);
+        // Free space calculation depends on page type
+        int typeMarker = data[0] & 0xFF;
         
-        return Math.max(0, pageSize - usedSpace);
+        switch (typeMarker) {
+            case SchemaManager.PAGE_TYPE_TABLE_DATA:
+                // Number of rows is at offset 13 (2 bytes)
+                int rowCount = ByteBuffer.wrap(data, 13, 2).getShort() & 0xFFFF;
+                // Free space offset is at offset 15 (2 bytes)
+                int freeSpaceOffset = ByteBuffer.wrap(data, 15, 2).getShort() & 0xFFFF;
+                int rowDirectorySize = rowCount * 8; // Each row entry takes 8 bytes in the directory
+                
+                // Calculate used space
+                int usedSpace = freeSpaceOffset + rowDirectorySize;
+                return Math.max(0, pageSize - usedSpace);
+            
+            default:
+                // For other pages, assume header only
+                return pageSize - 16;
+        }
     }
     
     /**
      * Get additional information about a page based on its type.
-     * This is a placeholder method - in a real implementation, this would extract
-     * type-specific information according to your database's internal page format.
+     * Decodes page-specific information based on the page type.
      *
      * @param data The page data
      * @param pageType The type of the page
      * @return Additional information as a string
      */
     private String getAdditionalPageInfo(byte[] data, String pageType) {
-        // This is a simplified implementation
-        // In a real system, you would extract different information based on page type
-        
-        if (data.length < 20) {
+        if (data.length < 32) {
             return "";
         }
         
-        switch (pageType) {
-            case "DATA":
-                // For data pages, maybe show record count
-                int recordCount = ((data[16] & 0xFF) << 8) | (data[17] & 0xFF);
-                return "Records: " + recordCount;
+        StringBuilder info = new StringBuilder();
+        ByteBuffer buffer = ByteBuffer.wrap(data);
+        
+        try {
+            switch (pageType) {
+                case "TABLE_HEADER":
+                    // First data page ID is at position 5
+                    int firstDataPageId = buffer.getInt(5);
+                    
+                    // Table name length is at position 9 (2 bytes)
+                    int tableNameLength = buffer.getShort(9) & 0xFFFF;
+                    if (tableNameLength > 0 && tableNameLength < 128) {
+                        // Table name starts at position 11
+                        StringBuilder tableName = new StringBuilder();
+                        for (int i = 0; i < tableNameLength; i++) {
+                            tableName.append(buffer.getChar(11 + i * 2));
+                        }
+                        
+                        // Number of columns is after the table name (2 bytes)
+                        int nameEndPos = 11 + tableNameLength * 2;
+                        int numColumns = buffer.getShort(nameEndPos) & 0xFFFF;
+                        
+                        info.append("Table: ").append(tableName)
+                            .append(", Columns: ").append(numColumns)
+                            .append(", FirstDataPage: ").append(firstDataPageId);
+                    }
+                    break;
                 
-            case "INDEX":
-                // For index pages, maybe show level and entry count
-                int level = data[16] & 0xFF;
-                int entryCount = ((data[17] & 0xFF) << 8) | (data[18] & 0xFF);
-                return "Level: " + level + ", Entries: " + entryCount;
+                case "TABLE_DATA":
+                    // Row count is at position 13 (2 bytes)
+                    int rowCount = buffer.getShort(13) & 0xFFFF;
+                    
+                    // Read free space offset at position 15 (2 bytes)
+                    int freeOffset = buffer.getShort(15) & 0xFFFF;
+                    
+                    // Calculate maximum rows based on page size and row directory size
+                    int directoryStart = 17; // Header size
+                    int rowDirectorySize = rowCount * 8; // Each entry has offset (4 bytes) and length (4 bytes)
+                    int availableSpace = data.length - directoryStart;
+                    int maxRows = availableSpace / 8; // Simple estimation
+                    
+                    info.append("Records: ").append(rowCount)
+                        .append("/~").append(maxRows)
+                        .append(", FreeOffset: ").append(freeOffset);
+                    
+                    // Show some row directory information if rows exist
+                    if (rowCount > 0) {
+                        info.append(", Rows: [");
+                        int maxRowsToShow = Math.min(3, rowCount); // Show at most 3 rows
+                        for (int i = 0; i < maxRowsToShow; i++) {
+                            int entryPos = directoryStart + i * 8;
+                            int rowOffset = buffer.getInt(entryPos);
+                            int rowLength = buffer.getInt(entryPos + 4);
+                            if (i > 0) info.append(", ");
+                            info.append("(").append(rowOffset).append(",").append(rowLength).append("b)");
+                        }
+                        if (rowCount > maxRowsToShow) info.append("...");
+                        info.append("]");
+                    }
+                    break;
                 
-            case "DIRECTORY":
-                // For directory pages, maybe show entry count
-                int dirEntries = ((data[16] & 0xFF) << 8) | (data[17] & 0xFF);
-                return "Entries: " + dirEntries;
+                case "INDEX_HEADER":
+                case "INDEX_INTERNAL":
+                case "INDEX_LEAF":
+                    // Is leaf flag is at position 5
+                    boolean isLeaf = buffer.get(5) == 1;
+                    
+                    // Number of keys is at position 6 (2 bytes)
+                    int numKeys = buffer.getShort(6) & 0xFFFF;
+                    
+                    // Key type is at position 8
+                    int keyType = buffer.get(8) & 0xFF;
+                    
+                    if (pageType.equals("INDEX_HEADER")) {
+                        // For index header, get index name if available
+                        // This would require parsing the rest of the header
+                        info.append("Keys: ").append(numKeys)
+                            .append(", KeyType: ").append(DataType.values()[keyType]);
+                    } else {
+                        info.append(isLeaf ? "Leaf" : "Internal")
+                            .append(", Keys: ").append(numKeys)
+                            .append(", KeyType: ").append(DataType.values()[keyType]);
+                        
+                        // For internal nodes, count child pointers
+                        if (!isLeaf) {
+                            int childPointers = numKeys + 1;
+                            info.append(", Children: ").append(childPointers);
+                        }
+                    }
+                    break;
                 
-            default:
-                return "";
+                case "SYSTEM_CATALOG":
+                    // Catalog type would be at position 1 for system catalog pages
+                    int catalogType = buffer.get(1) & 0xFF;
+                    String catalogTypeName;
+                    
+                    switch (catalogType) {
+                        case SchemaManager.CATALOG_TYPE_TABLESPACES: catalogTypeName = SchemaManager.SYS_TABLESPACES; break;
+                        case SchemaManager.CATALOG_TYPE_TABLES: catalogTypeName = SchemaManager.SYS_TABLES; break;
+                        case SchemaManager.CATALOG_TYPE_COLUMNS: catalogTypeName = SchemaManager.SYS_COLUMNS; break;
+                        case SchemaManager.CATALOG_TYPE_INDEXES: catalogTypeName = SchemaManager.SYS_INDEXES; break;
+                        case SchemaManager.CATALOG_TYPE_INDEX_COLUMNS: catalogTypeName = SchemaManager.SYS_INDEX_COLUMNS; break;
+                        default: catalogTypeName = "UNKNOWN"; break;
+                    }
+                    
+                    // Record count would be at position 2 for system catalog pages
+                    int recordCount = buffer.getShort(2) & 0xFFFF;
+                    info.append("Catalog: ").append(catalogTypeName)
+                        .append(", Records: ").append(recordCount);
+                    break;
+                
+                case "FREE_SPACE_MAP":
+                    // For container metadata/free space map
+                    // Tablespace name length is at position 5 (2 bytes)
+                    int tspNameLength = buffer.getShort(5) & 0xFFFF;
+                    if (tspNameLength > 0 && tspNameLength < 64) {
+                        // Tablespace name starts at position 7
+                        StringBuilder tspName = new StringBuilder();
+                        for (int i = 0; i < tspNameLength; i++) {
+                            tspName.append(buffer.getChar(7 + i * 2));
+                        }
+                        
+                        // Page size is after the tablespace name (4 bytes)
+                        int nameEndPos = 7 + tspNameLength * 2;
+                        int pageSize = buffer.getInt(nameEndPos);
+                        
+                        // Creation time is after page size (8 bytes)
+                        long creationTime = buffer.getLong(nameEndPos + 4);
+                        
+                        // Total pages is after creation time (4 bytes)
+                        int totalPages = buffer.getInt(nameEndPos + 12);
+                        
+                        info.append("Tablespace: ").append(tspName)
+                            .append(", PageSize: ").append(pageSize)
+                            .append(", TotalPages: ").append(totalPages);
+                    } else {
+                        info.append("Container metadata");
+                    }
+                    break;
+                    
+                case "TRANSACTION_LOG":
+                    // For transaction log pages
+                    // Transaction ID would be at position 5 (8 bytes)
+                    long txnId = buffer.getLong(5);
+                    
+                    // Status would be at position 13
+                    byte status = buffer.get(13);
+                    String statusStr;
+                    switch (status) {
+                        case 0: statusStr = "INACTIVE"; break;
+                        case 1: statusStr = "ACTIVE"; break;
+                        case 2: statusStr = "COMMITTING"; break;
+                        case 3: statusStr = "COMMITTED"; break;
+                        case 4: statusStr = "ABORTING"; break;
+                        case 5: statusStr = "ABORTED"; break;
+                        default: statusStr = "UNKNOWN"; break;
+                    }
+                    
+                    info.append("TxnID: ").append(txnId)
+                        .append(", Status: ").append(statusStr);
+                    break;
+                
+                case "CORRUPT":
+                    info.append("Page has invalid magic number");
+                    break;
+                
+                default:
+                    return "";
+            }
+        } catch (Exception e) {
+            return "Error parsing page data: " + e.getMessage();
         }
+        
+        return info.toString();
     }
     
     /**
