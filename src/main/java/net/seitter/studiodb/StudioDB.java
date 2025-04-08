@@ -10,6 +10,7 @@ import org.slf4j.LoggerFactory;
 import java.io.File;
 import java.io.IOException;
 import java.util.Arrays;
+import java.util.Map;
 
 // JLine imports
 import org.jline.reader.EndOfFileException;
@@ -258,6 +259,7 @@ public class StudioDB {
         terminal.writer().println("\n-- System Monitoring --");
         terminal.writer().println("SHOW BUFFERPOOLS;              Display buffer pool usage information");
         terminal.writer().println("SHOW STATISTICS;               Show detailed page allocation and buffer pool stats");
+        terminal.writer().println("SHOW PAGES IN TABLESPACE name; Display detailed page layout for a specific tablespace");
         
         // Data Types
         terminal.writer().println("\n-- Supported Data Types --");
@@ -460,8 +462,32 @@ public class StudioDB {
                 "SELECT", "INSERT", "UPDATE", "DELETE", 
                 "CREATE TABLE", "CREATE INDEX", "CREATE TABLESPACE",
                 "DROP TABLE", "DROP INDEX",
-                "SHOW TABLES", "SHOW INDEXES", "SHOW TABLESPACES", "SHOW BUFFERPOOLS"
+                "SHOW TABLES", "SHOW INDEXES", "SHOW TABLESPACES", "SHOW BUFFERPOOLS",
+                "SHOW STATISTICS", "SHOW PAGES"
             ));
+            return suggestions;
+        }
+        
+        // Context: SHOW PAGES - suggest IN TABLESPACE
+        if (buffer.matches("(?i).*show\\s+pages\\s*$")) {
+            suggestions.add("IN TABLESPACE");
+            return suggestions;
+        }
+        
+        // Context: SHOW PAGES IN TABLESPACE - need tablespace name
+        if (buffer.matches("(?i).*show\\s+pages\\s+in\\s+tablespace\\s*$")) {
+            // After SHOW PAGES IN TABLESPACE, expecting a tablespace name
+            // Get tablespace names from the system
+            if (dbSystem.getStorageManager() != null) {
+                try {
+                    java.lang.reflect.Field tablespacesField = dbSystem.getStorageManager().getClass().getDeclaredField("tablespaces");
+                    tablespacesField.setAccessible(true);
+                    Map<String, Object> tablespaces = (Map<String, Object>) tablespacesField.get(dbSystem.getStorageManager());
+                    suggestions.addAll(tablespaces.keySet());
+                } catch (Exception e) {
+                    logger.warn("Failed to get tablespace names for autocompletion", e);
+                }
+            }
             return suggestions;
         }
         
@@ -484,7 +510,7 @@ public class StudioDB {
             return suggestions;
         }
         
-        // Context: Inside CREATE TABLE definition
+        // Context: CREATE TABLE - need opening parenthesis
         if (buffer.matches("(?i).*create\\s+table\\s+\\w+\\s*\\(.*") && !buffer.contains(")")) {
             // Inside column definitions
             if (buffer.matches("(?i).*,\\s*$") || buffer.matches("(?i).*\\(\\s*$")) {

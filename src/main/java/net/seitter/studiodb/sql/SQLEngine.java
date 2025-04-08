@@ -643,6 +643,8 @@ public class SQLEngine {
                 return executeShowBufferPools();
             case "STATISTICS":
                 return executeShowStatistics();
+            case "PAGES":
+                return executeShowPages(parts.length > 1 ? parts[1] : "");
             default:
                 return "Unknown SHOW type: " + type;
         }
@@ -783,6 +785,265 @@ public class SQLEngine {
         }
         
         return sb.toString();
+    }
+    
+    /**
+     * Executes a SHOW PAGES statement to display detailed page layout for a tablespace.
+     *
+     * @param rest The rest of the statement (expected format: "IN TABLESPACE tablespace_name")
+     * @return The result of the statement showing detailed page information
+     */
+    private String executeShowPages(String rest) {
+        // Parse: SHOW PAGES IN TABLESPACE tablespace_name
+        Pattern pattern = Pattern.compile("IN\\s+TABLESPACE\\s+(\\w+)", Pattern.CASE_INSENSITIVE);
+        Matcher matcher = pattern.matcher(rest);
+        
+        if (!matcher.matches()) {
+            return "Invalid syntax. Expected: SHOW PAGES IN TABLESPACE tablespace_name";
+        }
+        
+        String tablespaceName = matcher.group(1);
+        StorageManager storageManager = dbSystem.getStorageManager();
+        
+        // Get the specified tablespace
+        Tablespace tablespace = null;
+        Map<String, Tablespace> tablespaces = new HashMap<>();
+        
+        try {
+            java.lang.reflect.Field tablespacesField = StorageManager.class.getDeclaredField("tablespaces");
+            tablespacesField.setAccessible(true);
+            tablespaces = (Map<String, Tablespace>) tablespacesField.get(storageManager);
+            tablespace = tablespaces.get(tablespaceName);
+        } catch (Exception e) {
+            logger.error("Failed to get tablespace", e);
+            return "Failed to retrieve tablespace information: " + e.getMessage();
+        }
+        
+        if (tablespace == null) {
+            return "Tablespace '" + tablespaceName + "' not found.";
+        }
+        
+        StringBuilder sb = new StringBuilder();
+        sb.append("PAGE LAYOUT FOR TABLESPACE: ").append(tablespaceName).append("\n\n");
+        sb.append(String.format("%-10s %-15s %-15s %-15s %-15s %-20s\n", 
+                "PAGE_ID", "TYPE", "NEXT_PAGE", "PREV_PAGE", "FREE_SPACE", "ADDITIONAL_INFO"));
+        sb.append(String.format("%-10s %-15s %-15s %-15s %-15s %-20s\n", 
+                "----------", "---------------", "---------------", "---------------", "---------------", "--------------------"));
+        
+        try {
+            // Get total pages in tablespace
+            int totalPages = tablespace.getTotalPages();
+            
+            // Get buffer pool manager for this tablespace to check if page is in memory
+            BufferPoolManager bpm = null;
+            Map<String, BufferPoolManager> bufferPools = new HashMap<>();
+            try {
+                java.lang.reflect.Field bpmsField = DatabaseSystem.class.getDeclaredField("bufferPoolManagers");
+                bpmsField.setAccessible(true);
+                bufferPools = (Map<String, BufferPoolManager>) bpmsField.get(dbSystem);
+                bpm = bufferPools.get(tablespaceName);
+            } catch (Exception e) {
+                logger.warn("Failed to get buffer pool manager", e);
+            }
+            
+            // Iterate through all pages
+            for (int pageNum = 0; pageNum < totalPages; pageNum++) {
+                PageId pageId = new PageId(tablespaceName, pageNum);
+                
+                // Try to fetch the page
+                Page page = null;
+                boolean pinned = false;
+                
+                try {
+                    if (bpm != null) {
+                        page = bpm.fetchPage(pageId);
+                        pinned = true;
+                    } else {
+                        // Direct fetch from disk if no buffer pool
+                        page = tablespace.readPage(pageNum);
+                    }
+                    
+                    if (page != null) {
+                        // Get page data
+                        byte[] data = page.getData();
+                        
+                        // Analyze the page - in a real implementation, this would have proper
+                        // page structure analysis based on your system's internal format
+                        String pageType = determinePageType(data);
+                        int nextPage = getNextPagePointer(data);
+                        int prevPage = getPrevPagePointer(data);
+                        int freeSpace = calculateFreeSpace(data, page.getPageSize());
+                        String additionalInfo = getAdditionalPageInfo(data, pageType);
+                        
+                        sb.append(String.format("%-10d %-15s %-15d %-15d %-15d %-20s\n", 
+                                pageNum, pageType, nextPage, prevPage, freeSpace, additionalInfo));
+                    } else {
+                        sb.append(String.format("%-10d %-15s %-15s %-15s %-15s %-20s\n", 
+                                pageNum, "UNALLOCATED", "N/A", "N/A", "N/A", ""));
+                    }
+                } catch (Exception e) {
+                    sb.append(String.format("%-10d %-15s %-15s %-15s %-15s %-20s\n", 
+                            pageNum, "ERROR", "N/A", "N/A", "N/A", e.getMessage()));
+                } finally {
+                    // Unpin the page if it was pinned
+                    if (pinned && page != null) {
+                        bpm.unpinPage(pageId, false);
+                    }
+                }
+            }
+        } catch (IOException e) {
+            logger.error("Error reading pages from tablespace", e);
+            return "Failed to read pages from tablespace: " + e.getMessage();
+        }
+        
+        return sb.toString();
+    }
+    
+    /**
+     * Determine the type of page based on its contents.
+     * This is a placeholder method - in a real implementation, this would analyze
+     * the page data according to your database's internal page format.
+     *
+     * @param data The page data
+     * @return The page type as a string
+     */
+    private String determinePageType(byte[] data) {
+        // This is a simplified implementation
+        // In a real system, you would examine header bytes or other markers
+        
+        // Check first few bytes to determine type
+        if (data.length < 4) {
+            return "EMPTY";
+        }
+        
+        // Simple logic to determine page type based on first byte
+        // This should be replaced with actual page type detection logic
+        int typeMarker = data[0] & 0xFF;
+        
+        if (typeMarker == 0) {
+            return "FREE";
+        } else if (typeMarker == 1) {
+            return "DATA";
+        } else if (typeMarker == 2) {
+            return "INDEX";
+        } else if (typeMarker == 3) {
+            return "DIRECTORY";
+        } else if (typeMarker == 4) {
+            return "METADATA";
+        } else {
+            return "UNKNOWN";
+        }
+    }
+    
+    /**
+     * Get the next page pointer from a page.
+     * This is a placeholder method - in a real implementation, this would read
+     * the next page pointer according to your database's internal page format.
+     *
+     * @param data The page data
+     * @return The next page number, or -1 if none
+     */
+    private int getNextPagePointer(byte[] data) {
+        // This is a simplified implementation
+        // In a real system, you would read a specific location in the page header
+        
+        if (data.length < 8) {
+            return -1;
+        }
+        
+        // Simple example: assuming next page pointer is at bytes 4-7
+        return ((data[4] & 0xFF) << 24) | 
+               ((data[5] & 0xFF) << 16) | 
+               ((data[6] & 0xFF) << 8) | 
+                (data[7] & 0xFF);
+    }
+    
+    /**
+     * Get the previous page pointer from a page.
+     * This is a placeholder method - in a real implementation, this would read
+     * the previous page pointer according to your database's internal page format.
+     *
+     * @param data The page data
+     * @return The previous page number, or -1 if none
+     */
+    private int getPrevPagePointer(byte[] data) {
+        // This is a simplified implementation
+        // In a real system, you would read a specific location in the page header
+        
+        if (data.length < 12) {
+            return -1;
+        }
+        
+        // Simple example: assuming prev page pointer is at bytes 8-11
+        return ((data[8] & 0xFF) << 24) | 
+               ((data[9] & 0xFF) << 16) | 
+               ((data[10] & 0xFF) << 8) | 
+                (data[11] & 0xFF);
+    }
+    
+    /**
+     * Calculate the free space in a page.
+     * This is a placeholder method - in a real implementation, this would calculate
+     * free space according to your database's internal page format.
+     *
+     * @param data The page data
+     * @param pageSize The total size of the page
+     * @return The amount of free space in bytes
+     */
+    private int calculateFreeSpace(byte[] data, int pageSize) {
+        // This is a simplified implementation
+        // In a real system, you would read the free space pointer or calculate based on used space
+        
+        if (data.length < 16) {
+            return pageSize;
+        }
+        
+        // Simple example: assuming free space pointer is at bytes 12-15
+        int usedSpace = ((data[12] & 0xFF) << 24) | 
+                         ((data[13] & 0xFF) << 16) | 
+                         ((data[14] & 0xFF) << 8) | 
+                          (data[15] & 0xFF);
+        
+        return Math.max(0, pageSize - usedSpace);
+    }
+    
+    /**
+     * Get additional information about a page based on its type.
+     * This is a placeholder method - in a real implementation, this would extract
+     * type-specific information according to your database's internal page format.
+     *
+     * @param data The page data
+     * @param pageType The type of the page
+     * @return Additional information as a string
+     */
+    private String getAdditionalPageInfo(byte[] data, String pageType) {
+        // This is a simplified implementation
+        // In a real system, you would extract different information based on page type
+        
+        if (data.length < 20) {
+            return "";
+        }
+        
+        switch (pageType) {
+            case "DATA":
+                // For data pages, maybe show record count
+                int recordCount = ((data[16] & 0xFF) << 8) | (data[17] & 0xFF);
+                return "Records: " + recordCount;
+                
+            case "INDEX":
+                // For index pages, maybe show level and entry count
+                int level = data[16] & 0xFF;
+                int entryCount = ((data[17] & 0xFF) << 8) | (data[18] & 0xFF);
+                return "Level: " + level + ", Entries: " + entryCount;
+                
+            case "DIRECTORY":
+                // For directory pages, maybe show entry count
+                int dirEntries = ((data[16] & 0xFF) << 8) | (data[17] & 0xFF);
+                return "Entries: " + dirEntries;
+                
+            default:
+                return "";
+        }
     }
     
     /**
