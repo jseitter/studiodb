@@ -12,6 +12,7 @@ import java.util.Map;
 
 /**
  * Manages all tablespaces and storage-related operations in the database system.
+ * This class is agnostic about page layouts and only handles raw page storage operations.
  */
 public class StorageManager {
     private static final Logger logger = LoggerFactory.getLogger(StorageManager.class);
@@ -116,6 +117,10 @@ public class StorageManager {
      * @throws IOException If there's an error writing the page
      */
     public void writePage(Page page) throws IOException {
+        if (page == null) {
+            throw new IllegalArgumentException("Page cannot be null");
+        }
+        
         Tablespace tablespace = tablespaces.get(page.getPageId().getTablespaceName());
         
         if (tablespace == null) {

@@ -1023,9 +1023,6 @@ public class SQLEngine {
                      typeMarker == SchemaManager.PAGE_TYPE_INDEX_INTERNAL ? "INDEX_INTERNAL" : "INDEX_LEAF") 
                     : "CORRUPT";
             
-            case SchemaManager.PAGE_TYPE_SYSTEM_CATALOG:
-                return "SYSTEM_CATALOG";
-            
             case SchemaManager.PAGE_TYPE_FREE_SPACE_MAP:
                 return (magic == SchemaManager.MAGIC_CONTAINER_METADATA) ? "FREE_SPACE_MAP" : "CORRUPT";
             

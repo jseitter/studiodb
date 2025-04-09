@@ -5,6 +5,10 @@ import net.seitter.studiodb.buffer.BufferPoolManager;
 import net.seitter.studiodb.buffer.IBufferPoolManager;
 import net.seitter.studiodb.storage.Page;
 import net.seitter.studiodb.storage.PageId;
+import net.seitter.studiodb.storage.PageLayout;
+import net.seitter.studiodb.storage.PageLayoutFactory;
+import net.seitter.studiodb.storage.PageType;
+import net.seitter.studiodb.storage.IndexPageLayout;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -34,30 +38,29 @@ public class SchemaManager {
     public static final String SYS_INDEXES = "SYS_INDEXES";
     public static final String SYS_INDEX_COLUMNS = "SYS_INDEX_COLUMNS";
     
-    // Page type magic numbers
-    public static final int PAGE_TYPE_UNUSED = 0;
-    public static final int PAGE_TYPE_TABLE_HEADER = 1;
-    public static final int PAGE_TYPE_TABLE_DATA = 2;
-    public static final int PAGE_TYPE_INDEX_HEADER = 3;
-    public static final int PAGE_TYPE_INDEX_INTERNAL = 4;
-    public static final int PAGE_TYPE_INDEX_LEAF = 5;
-    public static final int PAGE_TYPE_SYSTEM_CATALOG = 6;
-    public static final int PAGE_TYPE_FREE_SPACE_MAP = 7;
-    public static final int PAGE_TYPE_TRANSACTION_LOG = 8;
-    public static final int PAGE_TYPE_CONTAINER_METADATA = 9;
-    
-    // Page header magic numbers
-    public static final int MAGIC_TABLE_HEADER = 0xDADA0101;
-    public static final int MAGIC_TABLE_DATA = 0xDADA0201;
-    public static final int MAGIC_BTREE_PAGE = 0xDADA0301;
-    public static final int MAGIC_CONTAINER_METADATA = 0xDADA0001;
-    
     // System catalog type identifiers
     public static final int CATALOG_TYPE_TABLESPACES = 1;
     public static final int CATALOG_TYPE_TABLES = 2;
     public static final int CATALOG_TYPE_COLUMNS = 3;
     public static final int CATALOG_TYPE_INDEXES = 4;
     public static final int CATALOG_TYPE_INDEX_COLUMNS = 5;
+    
+    // Page type magic numbers - these are kept for backward compatibility
+    public static final int PAGE_TYPE_UNUSED = 0;
+    public static final int PAGE_TYPE_TABLE_HEADER = 1;
+    public static final int PAGE_TYPE_TABLE_DATA = 2;
+    public static final int PAGE_TYPE_INDEX_HEADER = 3;
+    public static final int PAGE_TYPE_INDEX_INTERNAL = 4;
+    public static final int PAGE_TYPE_INDEX_LEAF = 5;
+    public static final int PAGE_TYPE_FREE_SPACE_MAP = 7;
+    public static final int PAGE_TYPE_TRANSACTION_LOG = 8;
+    public static final int PAGE_TYPE_CONTAINER_METADATA = 9;
+    
+    // Page header magic numbers - these are kept for backward compatibility
+    public static final int MAGIC_TABLE_HEADER = 0xDADA0101;
+    public static final int MAGIC_TABLE_DATA = 0xDADA0201;
+    public static final int MAGIC_BTREE_PAGE = 0xDADA0301;
+    public static final int MAGIC_CONTAINER_METADATA = 0xDADA0001;
     
     /**
      * Creates a new schema manager.
@@ -253,49 +256,46 @@ public class SchemaManager {
             // Create the table object
             Table table = new Table(tableName, SYSTEM_TABLESPACE);
             table.addColumns(columns);
-            
             if (primaryKeyColumns != null && !primaryKeyColumns.isEmpty()) {
                 table.setPrimaryKey(primaryKeyColumns);
             }
             
             // Allocate header page
             IBufferPoolManager bufferPool = dbSystem.getBufferPoolManager(SYSTEM_TABLESPACE);
-            
             if (bufferPool == null) {
                 logger.error("System tablespace does not exist");
                 return null;
             }
             
             Page headerPage = bufferPool.allocatePage();
+            if (headerPage == null) {
+                logger.error("Failed to allocate header page for system table '{}'", tableName);
+                return null;
+            }
+            
             table.setHeaderPageId(headerPage.getPageId().getPageNumber());
             
             // Initialize header page with table info
             initializeTableHeaderPage(headerPage, table);
             
-            // Release the page
-            bufferPool.unpinPage(headerPage.getPageId(), true);
-            
             // Allocate first data page
             Page firstDataPage = bufferPool.allocatePage();
-            table.setFirstDataPageId(firstDataPage.getPageId().getPageNumber());
+            if (firstDataPage == null) {
+                logger.error("Failed to allocate first data page for system table '{}'", tableName);
+                return null;
+            }
             
             // Initialize the data page
             initializeTableDataPage(firstDataPage);
             
-            // Release the page
-            bufferPool.unpinPage(firstDataPage.getPageId(), true);
-            
             // Update the header page with the first data page ID
-            updateHeaderPageWithFirstDataPageId(headerPage.getPageId(), table.getFirstDataPageId(), bufferPool);
-            // flush all pages to disk
-            bufferPool.flushAll();
-
+            updateHeaderPageWithFirstDataPageId(headerPage.getPageId(), firstDataPage.getPageId().getPageNumber(), bufferPool);
+            
             // Store the table in our schema
             tables.put(tableName, table);
             tableIndexes.put(tableName, new ArrayList<>());
             
-            logger.info("Created system table '{}' in tablespace '{}'", 
-                    tableName, SYSTEM_TABLESPACE);
+            logger.info("Created system table '{}' in tablespace '{}'", tableName, SYSTEM_TABLESPACE);
             return table;
         } catch (IOException e) {
             logger.error("Failed to create system table '{}'", tableName, e);
@@ -619,68 +619,64 @@ public class SchemaManager {
     }
 
     /**
-     * Creates a new table.
+     * Creates a new table in the specified tablespace.
      *
      * @param tableName The name of the table
-     * @param tablespaceName The name of the tablespace to store the table in
+     * @param tablespaceName The name of the tablespace
      * @param columns The columns of the table
      * @param primaryKeyColumns The names of the columns that form the primary key
      * @return The created table
      */
     public Table createTable(String tableName, String tablespaceName, List<Column> columns, List<String> primaryKeyColumns) {
-        if (tables.containsKey(tableName)) {
-            logger.warn("Table '{}' already exists", tableName);
-            return null;
-        }
-        
         try {
-            // Create the table object
-            Table table = new Table(tableName, tablespaceName);
-            table.addColumns(columns);
-            
-            if (primaryKeyColumns != null && !primaryKeyColumns.isEmpty()) {
-                table.setPrimaryKey(primaryKeyColumns);
-            }
-            
-            // Allocate header page
+            // Get the buffer pool for the tablespace
             IBufferPoolManager bufferPool = dbSystem.getBufferPoolManager(tablespaceName);
-            
             if (bufferPool == null) {
-                logger.error("Tablespace '{}' does not exist", tablespaceName);
+                logger.error("Tablespace '{}' not found", tablespaceName);
                 return null;
             }
             
+            // Allocate a header page
             Page headerPage = bufferPool.allocatePage();
+            if (headerPage == null) {
+                logger.error("Failed to allocate header page for table '{}'", tableName);
+                return null;
+            }
+            
+            // Create the table object
+            Table table = new Table(tableName, tablespaceName);
+            table.addColumns(columns);
+            if (primaryKeyColumns != null && !primaryKeyColumns.isEmpty()) {
+                table.setPrimaryKey(primaryKeyColumns);
+            }
             table.setHeaderPageId(headerPage.getPageId().getPageNumber());
             
-            // Initialize header page with table info
+            // Initialize the header page
             initializeTableHeaderPage(headerPage, table);
             
-            // Release the page
-            bufferPool.unpinPage(headerPage.getPageId(), true);
-            
-            // Allocate first data page
-            Page firstDataPage = bufferPool.allocatePage();
-            table.setFirstDataPageId(firstDataPage.getPageId().getPageNumber());
+            // Allocate and initialize the first data page
+            Page dataPage = bufferPool.allocatePage();
+            if (dataPage == null) {
+                logger.error("Failed to allocate data page for table '{}'", tableName);
+                return null;
+            }
             
             // Initialize the data page
-            initializeTableDataPage(firstDataPage);
-            
-            // Release the page
-            bufferPool.unpinPage(firstDataPage.getPageId(), true);
+            initializeTableDataPage(dataPage);
             
             // Update the header page with the first data page ID
-            updateHeaderPageWithFirstDataPageId(headerPage.getPageId(), table.getFirstDataPageId(), bufferPool);
+            updateHeaderPageWithFirstDataPageId(headerPage.getPageId(), dataPage.getPageId().getPageNumber(), bufferPool);
             
-            // Store the table in our schema
+            // Add the table to our cache
             tables.put(tableName, table);
+            
+            // Initialize the table's index list
             tableIndexes.put(tableName, new ArrayList<>());
             
-            // Persist to system catalog
+            // Persist the table information to the system catalog
             persistTableToCatalog(table);
             
-            logger.info("Created table '{}' in tablespace '{}' with {} columns", 
-                    tableName, tablespaceName, columns.size());
+            logger.info("Created table '{}' in tablespace '{}'", tableName, tablespaceName);
             return table;
         } catch (IOException e) {
             logger.error("Failed to create table '{}'", tableName, e);
@@ -689,81 +685,88 @@ public class SchemaManager {
     }
     
     /**
-     * Initializes a table header page with the table schema information.
+     * Initializes a table header page.
      *
      * @param headerPage The header page to initialize
-     * @param table The table
+     * @param table The table information
+     * @throws IOException If there's an error writing the page
      */
-    private void initializeTableHeaderPage(Page headerPage, Table table) {
+    private void initializeTableHeaderPage(Page headerPage, Table table) throws IOException {
+        // Create a table header page layout
+        PageLayout headerLayout = PageLayoutFactory.createNewPage(headerPage.getPageId(), headerPage.getPageSize(), PageType.TABLE_HEADER);
+        
+        // Write table metadata
         ByteBuffer buffer = headerPage.getBuffer();
-        
-        // Basic format of the header page:
-        // [Page Type (1 byte)] [Magic Number (4 bytes)] [First Data Page ID (4 bytes)]
-        // [Table Name Length (2 bytes)] [Table Name (variable)]
-        // [Number of Columns (2 bytes)] [Column Definitions...]
-        
-        // Write page type marker
-        buffer.put((byte) PAGE_TYPE_TABLE_HEADER);
-        
-        // Write magic number
-        buffer.putInt(MAGIC_TABLE_HEADER);
-        
-        // Reserve space for first data page ID (will be updated later)
-        buffer.putInt(-1);
+        buffer.position(21); // Skip page layout header (HEADER_SIZE is protected)
         
         // Write table name
-        String tableName = table.getName();
-        buffer.putShort((short) tableName.length());
-        for (int i = 0; i < tableName.length(); i++) {
-            buffer.putChar(tableName.charAt(i));
+        buffer.putShort((short) table.getName().length());
+        for (int i = 0; i < table.getName().length(); i++) {
+            buffer.putChar(table.getName().charAt(i));
         }
         
-        // Write number of columns
-        List<Column> columns = table.getColumns();
-        buffer.putShort((short) columns.size());
+        // Write tablespace name
+        buffer.putShort((short) table.getTablespaceName().length());
+        for (int i = 0; i < table.getTablespaceName().length(); i++) {
+            buffer.putChar(table.getTablespaceName().charAt(i));
+        }
         
-        // Write column definitions
-        for (Column column : columns) {
-            // Column format: [Name Length (2 bytes)] [Name (variable)] [Data Type (1 byte)]
-            // [Nullable (1 byte)] [Max Length (4 bytes)]
-            String columnName = column.getName();
-            buffer.putShort((short) columnName.length());
-            for (int i = 0; i < columnName.length(); i++) {
-                buffer.putChar(columnName.charAt(i));
+        // Write column count
+        buffer.putInt(table.getColumns().size());
+        
+        // Write column information
+        for (Column column : table.getColumns()) {
+            // Write column name
+            buffer.putShort((short) column.getName().length());
+            for (int i = 0; i < column.getName().length(); i++) {
+                buffer.putChar(column.getName().charAt(i));
             }
             
-            buffer.put((byte) column.getDataType().ordinal());
-            buffer.put(column.isNullable() ? (byte) 1 : (byte) 0);
-            buffer.putInt(column.getMaxLength());
+            // Write column type
+            buffer.putInt(column.getDataType().ordinal());
+            
+            // Write nullable flag
+            buffer.put(column.isNullable() ? (byte)1 : (byte)0);
+            
+            // Write max length for VARCHAR
+            if (column.getDataType() == DataType.VARCHAR) {
+                buffer.putInt(column.getMaxLength());
+            }
+            
+            // Write primary key flag
+            buffer.put(table.getPrimaryKey().contains(column.getName()) ? (byte)1 : (byte)0);
         }
         
-        headerPage.markDirty();
+        // Initialize the page layout
+        headerLayout.initialize();
     }
     
     /**
      * Updates the header page with the first data page ID.
      *
-     * @param headerPageId The ID of the header page
-     * @param firstDataPageId The ID of the first data page
+     * @param headerPageId The header page ID
+     * @param firstDataPageId The first data page ID
      * @param bufferPool The buffer pool manager
-     * @throws IOException If there's an error accessing the page
+     * @throws IOException If there's an error writing the page
      */
     private void updateHeaderPageWithFirstDataPageId(PageId headerPageId, int firstDataPageId, 
                                                     IBufferPoolManager bufferPool) throws IOException {
         Page headerPage = bufferPool.fetchPage(headerPageId);
-        
         if (headerPage == null) {
-            throw new IOException("Failed to fetch header page " + headerPageId);
+            throw new IOException("Failed to fetch header page");
         }
         
         try {
             ByteBuffer buffer = headerPage.getBuffer();
-            // Skip page type and magic number
-            buffer.position(5);
+            buffer.position(25); // Skip header (21) and column count (4)
+            
+            // Write first data page ID
             buffer.putInt(firstDataPageId);
+            
+            // Mark the page as dirty
             headerPage.markDirty();
         } finally {
-            bufferPool.unpinPage(headerPage.getPageId(), true);
+            bufferPool.unpinPage(headerPageId, true);
         }
     }
     
@@ -771,34 +774,14 @@ public class SchemaManager {
      * Initializes a table data page.
      *
      * @param dataPage The data page to initialize
+     * @throws IOException If there's an error writing the page
      */
-    private void initializeTableDataPage(Page dataPage) {
-        ByteBuffer buffer = dataPage.getBuffer();
+    private void initializeTableDataPage(Page dataPage) throws IOException {
+        // Create a table data page layout
+        PageLayout dataLayout = PageLayoutFactory.createNewPage(dataPage.getPageId(), dataPage.getPageSize(), PageType.TABLE_DATA);
         
-        // Basic format of a data page:
-        // [Page Type (1 byte)] [Magic Number (4 bytes)] [Next Page ID (4 bytes)] [Prev Page ID (4 bytes)]
-        // [Number of Rows (4 bytes)] [Free Space Offset (4 bytes)] [Row Directory...] [Row Data...]
-        
-        // Write page type marker
-        buffer.put((byte) PAGE_TYPE_TABLE_DATA);
-        
-        // Write magic number
-        buffer.putInt(MAGIC_TABLE_DATA);
-        
-        // No next page yet
-        buffer.putInt(-1);
-        
-        // No previous page yet
-        buffer.putInt(-1);
-        
-        // No rows yet (4 bytes)
-        buffer.putInt(0);
-        
-        // Free space starts after the header (4 bytes)
-        int headerSize = 21; // 1 (type) + 4 (magic) + 4 (next) + 4 (prev) + 4 (rows) + 4 (free offset)
-        buffer.putInt(headerSize);
-        
-        dataPage.markDirty();
+        // Initialize the page layout
+        dataLayout.initialize();
     }
     
     /**
@@ -874,36 +857,30 @@ public class SchemaManager {
     }
     
     /**
-     * Initializes a B-Tree root page.
+     * Initializes a B-Tree root page for an index.
      *
      * @param rootPage The root page to initialize
-     * @param index The index
+     * @param index The index information
+     * @throws IOException If there's an error writing the page
      */
-    private void initializeBTreeRootPage(Page rootPage, Index index) {
-        ByteBuffer buffer = rootPage.getBuffer();
-        
-        // Basic format of a B-Tree page:
-        // [Page Type (1 byte)] [Magic Number (4 bytes)] [Is Leaf (1 byte)] [Number of Keys (2 bytes)]
-        // [Key Type (1 byte)] [Key Entries...] [Child Pointers...]
-        
-        // Write page type marker (leaf B-tree page initially)
-        buffer.put((byte) PAGE_TYPE_INDEX_LEAF);
-        
-        // Write magic number
-        buffer.putInt(MAGIC_BTREE_PAGE);
-        
-        // This is a leaf node (initially)
-        buffer.put((byte) 1);
-        
-        // No keys yet
-        buffer.putShort((short) 0);
-        
-        // Store the key type based on the first indexed column
+    private void initializeBTreeRootPage(Page rootPage, Index index) throws IOException {
+        // Get the table and first indexed column
         Table table = tables.get(index.getTableName());
+        if (table == null) {
+            throw new IOException("Table '" + index.getTableName() + "' not found");
+        }
+        
         String firstColumnName = index.getColumnNames().get(0);
         Column firstColumn = table.getColumn(firstColumnName);
-        buffer.put((byte) firstColumn.getDataType().ordinal());
+        if (firstColumn == null) {
+            throw new IOException("Column '" + firstColumnName + "' not found in table '" + index.getTableName() + "'");
+        }
         
+        // Create and initialize the index page layout
+        IndexPageLayout indexLayout = new IndexPageLayout(rootPage);
+        indexLayout.initialize(PageType.INDEX_LEAF, firstColumn.getDataType());
+        
+        // Mark the page as dirty
         rootPage.markDirty();
     }
     

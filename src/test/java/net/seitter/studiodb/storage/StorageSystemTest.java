@@ -21,6 +21,8 @@ import net.seitter.studiodb.schema.Column;
 import net.seitter.studiodb.schema.DataType;
 import net.seitter.studiodb.schema.SchemaManager;
 import net.seitter.studiodb.schema.Table;
+import net.seitter.studiodb.storage.TableDataPageLayout;
+import net.seitter.studiodb.storage.PageLayout;
 
 /**
  * Comprehensive tests for the storage system components, focusing on tablespace
@@ -147,39 +149,13 @@ public class StorageSystemTest {
         byte[] rowData = serializeRow(row);
         assertTrue(rowData.length > 0, "Row data should be serialized");
         
-        // Write to the page similar to insertIntoSystemTable
-        ByteBuffer dataBuffer = dataPage.getBuffer();
+        // Get the data page and its layout
+        TableDataPageLayout layout = new TableDataPageLayout(dataPage);
+        layout.initialize();
         
-        // Read current row count and free space offset
-        dataBuffer.position(8); // Skip magic and next page ID
-        int rowCount = dataBuffer.getInt();
-        int freeSpaceOffset = dataBuffer.getInt();
-        
-        // If this is a new page, initialize free space
-        if (freeSpaceOffset == 16) {
-            freeSpaceOffset = dataBuffer.capacity();
-        }
-        
-        // Store row from end of page backward
-        int newRowOffset = freeSpaceOffset - rowData.length;
-        int rowDirectoryPos = 16 + rowCount * 8;
-        
-        // Check space
-        assertTrue(rowDirectoryPos + 8 < newRowOffset, "Should have enough space for the row");
-        
-        // Update directory
-        dataBuffer.position(rowDirectoryPos);
-        dataBuffer.putInt(newRowOffset);
-        dataBuffer.putInt(rowData.length);
-        
-        // Write row data
-        dataBuffer.position(newRowOffset);
-        dataBuffer.put(rowData);
-        
-        // Update metadata
-        dataBuffer.position(8);
-        dataBuffer.putInt(rowCount + 1);
-        dataBuffer.putInt(newRowOffset);
+        // Add the row using the layout
+        boolean added = layout.addRow(rowData);
+        assertTrue(added, "Row should be added successfully");
         
         // Mark dirty and unpin
         dataPage.markDirty();
@@ -193,14 +169,15 @@ public class StorageSystemTest {
         assertNotNull(retrievePage, "Should be able to fetch the page again");
         
         ByteBuffer retrieveBuffer = retrievePage.getBuffer();
-        retrieveBuffer.position(8);
+        retrieveBuffer.position(13);  // Row count is at offset 13
         int retrievedRowCount = retrieveBuffer.getInt();
         assertEquals(1, retrievedRowCount, "Should have 1 row");
         
-        // Skip free space offset
-        retrieveBuffer.getInt();
+        // Get free space offset
+        int freeSpaceOffset = retrieveBuffer.getInt();
         
         // Read directory entry
+        retrieveBuffer.position(PageLayout.HEADER_SIZE);  // Directory starts after header
         int storedOffset = retrieveBuffer.getInt();
         int storedLength = retrieveBuffer.getInt();
         
