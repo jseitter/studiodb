@@ -44,6 +44,7 @@ public class SchemaManager {
     public static final int PAGE_TYPE_SYSTEM_CATALOG = 6;
     public static final int PAGE_TYPE_FREE_SPACE_MAP = 7;
     public static final int PAGE_TYPE_TRANSACTION_LOG = 8;
+    public static final int PAGE_TYPE_CONTAINER_METADATA = 9;
     
     // Page header magic numbers
     public static final int MAGIC_TABLE_HEADER = 0xDADA0101;
@@ -118,6 +119,11 @@ public class SchemaManager {
                 Table sysTablespacesTable = createSystemTable(SYS_TABLESPACES, tablespaceColumns, tablespacePK);
                 if (sysTablespacesTable != null) {
                     logger.info("Created system catalog table: {}", SYS_TABLESPACES);
+                    
+                    // Persist the system tablespace information since we just created the catalog
+                    persistTablespaceToCatalog(SYSTEM_TABLESPACE, 
+                            dbSystem.getStorageManager().getTablespace(SYSTEM_TABLESPACE).getStorageContainer().getContainerPath(),
+                            dbSystem.getStorageManager().getPageSize());
                 } else {
                     logger.error("Failed to create system catalog table: {}", SYS_TABLESPACES);
                     allTablesCreated = false;
@@ -521,7 +527,7 @@ public class SchemaManager {
                 
                 // Read current row count and free space offset
                 ByteBuffer dataBuffer = dataPage.getBuffer();
-                dataBuffer.position(8); // Skip magic and next page ID
+                dataBuffer.position(13); // Skip magic, next page ID, prev page ID, and row count
                 int rowCount = dataBuffer.getInt();
                 int freeSpaceOffset = dataBuffer.getInt();
                 
@@ -550,8 +556,8 @@ public class SchemaManager {
                 dataBuffer.position(newRowOffset);
                 dataBuffer.put(rowData);
                 
-                // Update metadata
-                dataBuffer.position(8);
+                // Update metadata - row count and free space offset
+                dataBuffer.position(13);
                 dataBuffer.putInt(rowCount + 1);
                 dataBuffer.putInt(newRowOffset);
                 
@@ -771,7 +777,7 @@ public class SchemaManager {
         
         // Basic format of a data page:
         // [Page Type (1 byte)] [Magic Number (4 bytes)] [Next Page ID (4 bytes)] [Prev Page ID (4 bytes)]
-        // [Number of Rows (2 bytes)] [Free Space Offset (2 bytes)] [Row Directory...] [Row Data...]
+        // [Number of Rows (4 bytes)] [Free Space Offset (4 bytes)] [Row Directory...] [Row Data...]
         
         // Write page type marker
         buffer.put((byte) PAGE_TYPE_TABLE_DATA);
@@ -785,11 +791,12 @@ public class SchemaManager {
         // No previous page yet
         buffer.putInt(-1);
         
-        // No rows yet
-        buffer.putShort((short) 0);
+        // No rows yet (4 bytes)
+        buffer.putInt(0);
         
-        // Free space starts after the header
-        buffer.putShort((short) 15); // 1 (type) + 4 (magic) + 4 (next) + 4 (prev) + 2 (rows) + 2 (free space offset) - starting from 0
+        // Free space starts after the header (4 bytes)
+        int headerSize = 21; // 1 (type) + 4 (magic) + 4 (next) + 4 (prev) + 4 (rows) + 4 (free offset)
+        buffer.putInt(headerSize);
         
         dataPage.markDirty();
     }

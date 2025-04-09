@@ -40,7 +40,9 @@ public class DatabaseSystem {
         boolean systemTablespaceCreated = false;
         String systemTablespaceName = "SYSTEM";
         String systemTablespacePath = "./data/system_tablespace.dat";
-        int initialSizePages = 100;
+        
+        // get a decent base size for the system tablespace
+        int initialSizePages = 100; 
         
         try {
             // Check if system tablespace file exists
@@ -54,23 +56,13 @@ public class DatabaseSystem {
                 logger.error("Failed to {} system tablespace", exists ? "open" : "create");
             } else {
                 logger.info("{} system tablespace successfully", exists ? "Opened" : "Created");
-                systemTablespaceCreated = !exists; // Only mark as created if it didn't exist before
             }
         } catch (Exception e) {
             logger.error("Error initializing system tablespace", e);
         }
-       // Initialize schema manager
-        this.schemaManager = new SchemaManager(this);
         
-        // Now that schema manager is initialized, persist system tablespace info if it was newly created
-        if (systemTablespaceCreated) {
-            try {
-                schemaManager.persistTablespaceToCatalog("SYSTEM", systemTablespacePath, DEFAULT_PAGE_SIZE);
-                logger.info("Persisted system tablespace information to system catalog");
-            } catch (Exception e) {
-                logger.error("Failed to persist system tablespace information", e);
-            }
-        }
+        // Initialize schema manager
+        this.schemaManager = new SchemaManager(this);
         
         logger.info("Database system initialized with page size: {} bytes", DEFAULT_PAGE_SIZE);
     }
