@@ -14,7 +14,7 @@
         </encoder>
     </appender>
     
-    <logger name="com.studidb" level="DEBUG" />
+    <logger name="com.studiodb" level="DEBUG" />
     
     <root level="INFO">
         <appender-ref ref="CONSOLE" />
