@@ -2,6 +2,7 @@ package net.seitter.studiodb.sql;
 
 import net.seitter.studiodb.DatabaseSystem;
 import net.seitter.studiodb.buffer.BufferPoolManager;
+import net.seitter.studiodb.buffer.IBufferPoolManager;
 import net.seitter.studiodb.schema.Column;
 import net.seitter.studiodb.schema.DataType;
 import net.seitter.studiodb.schema.Index;
@@ -341,8 +342,9 @@ public class SQLEngine {
      *
      * @param rest The rest of the statement
      * @return The result of the statement
+     * @throws IOException If there's an error accessing the storage
      */
-    private String executeInsert(String rest) {
+    private String executeInsert(String rest) throws IOException {
         // Parse: INSERT INTO table (col1, col2, ...) VALUES (val1, val2, ...)
         Pattern pattern = Pattern.compile("INTO\\s+(\\w+)(?:\\s+\\((.+)\\))?\\s+VALUES\\s+\\((.+)\\)", 
                                         Pattern.CASE_INSENSITIVE);
@@ -430,8 +432,95 @@ public class SQLEngine {
             return "Invalid row data";
         }
         
-        // For educational purposes, we'll just pretend to insert the data
-        return "Inserted 1 row into table '" + tableName + "'";
+        // Get the buffer pool for the tablespace
+        IBufferPoolManager bufferPool = dbSystem.getBufferPoolManager(table.getTablespaceName());
+        if (bufferPool == null) {
+            return "Error: Tablespace '" + table.getTablespaceName() + "' not found";
+        }
+        
+        // Get the header page
+        PageId headerPageId = new PageId(table.getTablespaceName(), table.getHeaderPageId());
+        Page headerPage = bufferPool.fetchPage(headerPageId);
+        if (headerPage == null) {
+            bufferPool.unpinPage(headerPageId, false);
+            return "Error: Header page not found";
+        }
+        
+        // Get the first data page ID
+        ByteBuffer headerBuffer = headerPage.getBuffer();
+        headerBuffer.position(4); // Skip magic number
+        int firstDataPageId = headerBuffer.getInt();
+        bufferPool.unpinPage(headerPageId, false);
+        
+        // Get the data page
+        PageId dataPageId = new PageId(table.getTablespaceName(), firstDataPageId);
+        Page dataPage = bufferPool.fetchPage(dataPageId);
+        if (dataPage == null) {
+            return "Error: Data page not found";
+        }
+        
+        try {
+            // Serialize the row data
+            byte[] rowData;
+            try {
+                rowData = serializeRow(row);
+            } catch (IOException e) {
+                logger.error("Error serializing row data", e);
+                return "Error: Failed to serialize row data";
+            }
+            
+            // Read current row count and free space offset
+            ByteBuffer dataBuffer = dataPage.getBuffer();
+            dataBuffer.position(13); // Skip magic, next page ID, prev page ID, and row count
+            int rowCount = dataBuffer.getInt();
+            int freeSpaceOffset = dataBuffer.getInt();
+            
+            // If this is a new page, initialize free space
+            if (freeSpaceOffset == 16) {
+                freeSpaceOffset = dataBuffer.capacity();
+            }
+            
+            // Store row from end of page backward
+            int newRowOffset = freeSpaceOffset - rowData.length;
+            int rowDirectoryPos = 16 + rowCount * 8;
+            
+            // Check if we have enough space
+            if (rowDirectoryPos + 8 >= newRowOffset) {
+                return "Error: Not enough space in data page";
+            }
+            
+            // Update directory
+            dataBuffer.position(rowDirectoryPos);
+            dataBuffer.putInt(newRowOffset);
+            dataBuffer.putInt(rowData.length);
+            
+            // Write row data
+            dataBuffer.position(newRowOffset);
+            dataBuffer.put(rowData);
+            
+            // Update metadata - row count and free space offset
+            dataBuffer.position(13);
+            dataBuffer.putInt(rowCount + 1);
+            dataBuffer.putInt(newRowOffset);
+            
+            // Mark page as dirty
+            dataPage.markDirty();
+            
+            // Unpin the data page first
+            bufferPool.unpinPage(dataPageId, true);
+            
+            // Force flush all pages to ensure they are written to disk
+            try {
+                bufferPool.flushAll();
+            } catch (IOException e) {
+                logger.error("Error flushing buffer pool after insert", e);
+                return "Error: Failed to flush changes to disk";
+            }
+            
+            return "Inserted 1 row into table '" + tableName + "'";
+        } finally {
+            // Remove the unpin from finally block since we already unpinned above
+        }
     }
     
     /**
@@ -826,10 +915,10 @@ public class SQLEngine {
         
         StringBuilder sb = new StringBuilder();
         sb.append("PAGE LAYOUT FOR TABLESPACE: ").append(tablespaceName).append("\n\n");
-        sb.append(String.format("%-10s %-15s %-15s %-15s %-15s %-20s\n", 
+        sb.append(String.format("%-10s %-20s %-15s %-15s %-15s %-20s\n", 
                 "PAGE_ID", "TYPE", "NEXT_PAGE", "PREV_PAGE", "FREE_SPACE", "ADDITIONAL_INFO"));
-        sb.append(String.format("%-10s %-15s %-15s %-15s %-15s %-20s\n", 
-                "----------", "---------------", "---------------", "---------------", "---------------", "--------------------"));
+        sb.append(String.format("%-10s %-20s %-15s %-15s %-15s %-20s\n", 
+                "----------", "--------------------", "---------------", "---------------", "---------------", "--------------------"));
         
         try {
             // Get total pages in tablespace
@@ -876,14 +965,14 @@ public class SQLEngine {
                         int freeSpace = calculateFreeSpace(data, page.getPageSize());
                         String additionalInfo = getAdditionalPageInfo(data, pageType);
                         
-                        sb.append(String.format("%-10d %-15s %-15d %-15d %-15d %-20s\n", 
+                        sb.append(String.format("%-10d %-20s %-15d %-15d %-15d %-20s\n", 
                                 pageNum, pageType, nextPage, prevPage, freeSpace, additionalInfo));
                     } else {
-                        sb.append(String.format("%-10d %-15s %-15s %-15s %-15s %-20s\n", 
+                        sb.append(String.format("%-10d %-20s %-15s %-15s %-15s %-20s\n", 
                                 pageNum, "UNALLOCATED", "N/A", "N/A", "N/A", ""));
                     }
                 } catch (Exception e) {
-                    sb.append(String.format("%-10d %-15s %-15s %-15s %-15s %-20s\n", 
+                    sb.append(String.format("%-10d %-20s %-15s %-15s %-15s %-20s\n", 
                             pageNum, "ERROR", "N/A", "N/A", "N/A", e.getMessage()));
                 } finally {
                     // Unpin the page if it was pinned
@@ -939,6 +1028,9 @@ public class SQLEngine {
             
             case SchemaManager.PAGE_TYPE_FREE_SPACE_MAP:
                 return (magic == SchemaManager.MAGIC_CONTAINER_METADATA) ? "FREE_SPACE_MAP" : "CORRUPT";
+            
+            case SchemaManager.PAGE_TYPE_CONTAINER_METADATA:
+                return (magic == SchemaManager.MAGIC_CONTAINER_METADATA) ? "CONTAINER_METADATA" : "CORRUPT";
             
             case SchemaManager.PAGE_TYPE_TRANSACTION_LOG:
                 return "TRANSACTION_LOG";
@@ -1023,10 +1115,10 @@ public class SQLEngine {
         
         switch (typeMarker) {
             case SchemaManager.PAGE_TYPE_TABLE_DATA:
-                // Number of rows is at offset 13 (2 bytes)
-                int rowCount = ByteBuffer.wrap(data, 13, 2).getShort() & 0xFFFF;
-                // Free space offset is at offset 15 (2 bytes)
-                int freeSpaceOffset = ByteBuffer.wrap(data, 15, 2).getShort() & 0xFFFF;
+                // Number of rows is at offset 13 (4 bytes)
+                int rowCount = ByteBuffer.wrap(data, 13, 4).getInt();
+                // Free space offset is at offset 17 (4 bytes)
+                int freeSpaceOffset = ByteBuffer.wrap(data, 17, 4).getInt();
                 int rowDirectorySize = rowCount * 8; // Each row entry takes 8 bytes in the directory
                 
                 // Calculate used space
@@ -1081,30 +1173,31 @@ public class SQLEngine {
                     break;
                 
                 case "TABLE_DATA":
-                    // Row count is at position 13 (2 bytes)
-                    int rowCount = buffer.getShort(13) & 0xFFFF;
+                    // Row count is at position 13 (4 bytes)
+                    buffer.position(13);
+                    int rowCount = buffer.getInt();
                     
-                    // Read free space offset at position 15 (2 bytes)
-                    int freeOffset = buffer.getShort(15) & 0xFFFF;
+                    // Read free space offset at position 17 (4 bytes)
+                    buffer.position(17);
+                    int freeOffset = buffer.getInt();
                     
-                    // Calculate maximum rows based on page size and row directory size
-                    int directoryStart = 17; // Header size
-                    int rowDirectorySize = rowCount * 8; // Each entry has offset (4 bytes) and length (4 bytes)
-                    int availableSpace = data.length - directoryStart;
-                    int maxRows = availableSpace / 8; // Simple estimation
+                    // Calculate actual free space
+                    int headerSize = 21; // 1 (type) + 4 (magic) + 4 (next) + 4 (prev) + 4 (rows) + 4 (free offset)
+                    int rowDirectorySize = rowCount * 8; // Each row entry has offset (4 bytes) and length (4 bytes)
+                    int actualFreeSpace = data.length - (headerSize + rowDirectorySize + freeOffset);
                     
                     info.append("Records: ").append(rowCount)
-                        .append("/~").append(maxRows)
-                        .append(", FreeOffset: ").append(freeOffset);
+                        .append(", FreeSpace: ").append(actualFreeSpace).append(" bytes");
                     
                     // Show some row directory information if rows exist
                     if (rowCount > 0) {
                         info.append(", Rows: [");
                         int maxRowsToShow = Math.min(3, rowCount); // Show at most 3 rows
                         for (int i = 0; i < maxRowsToShow; i++) {
-                            int entryPos = directoryStart + i * 8;
-                            int rowOffset = buffer.getInt(entryPos);
-                            int rowLength = buffer.getInt(entryPos + 4);
+                            int entryPos = headerSize + i * 8;
+                            buffer.position(entryPos);
+                            int rowOffset = buffer.getInt();
+                            int rowLength = buffer.getInt();
                             if (i > 0) info.append(", ");
                             info.append("(").append(rowOffset).append(",").append(rowLength).append("b)");
                         }
@@ -1164,7 +1257,40 @@ public class SQLEngine {
                     break;
                 
                 case "FREE_SPACE_MAP":
-                    // For container metadata/free space map
+                    // For free space map pages
+                    // Last checked page is at position 5 (4 bytes)
+                    int lastCheckedPage = buffer.getInt(5);
+                    
+                    // Bitmap capacity is at position 9 (4 bytes)
+                    int bitmapCapacity = buffer.getInt(9);
+                    
+                    // Count free pages by examining the bitmap
+                    int freePages = 0;
+                    int bitmapOffset = 13; // 1 (type) + 4 (magic) + 4 (last checked) + 4 (capacity)
+                    
+                    // For demonstration, examine just the first 100 pages or so
+                    int pagesToCheck = Math.min(100, bitmapCapacity);
+                    for (int pageNum = 2; pageNum < pagesToCheck; pageNum++) {
+                        int byteOffset = pageNum / 8;
+                        int bitOffset = pageNum % 8;
+                        
+                        if (byteOffset >= (data.length - bitmapOffset)) {
+                            break;
+                        }
+                        
+                        byte currentByte = buffer.get(bitmapOffset + byteOffset);
+                        if ((currentByte & (1 << bitOffset)) != 0) {
+                            freePages++;
+                        }
+                    }
+                    
+                    info.append("Free space map, LastChecked: ").append(lastCheckedPage)
+                        .append(", Capacity: ").append(bitmapCapacity)
+                        .append(", FreePagesFound: ").append(freePages);
+                    break;
+                
+                case "CONTAINER_METADATA":
+                    // For container metadata
                     // Tablespace name length is at position 5 (2 bytes)
                     int tspNameLength = buffer.getShort(5) & 0xFFFF;
                     if (tspNameLength > 0 && tspNameLength < 64) {
@@ -1191,7 +1317,7 @@ public class SQLEngine {
                         info.append("Container metadata");
                     }
                     break;
-                    
+                
                 case "TRANSACTION_LOG":
                     // For transaction log pages
                     // Transaction ID would be at position 5 (8 bytes)
@@ -1333,5 +1459,16 @@ public class SQLEngine {
         }
         
         return sb.toString();
+    }
+    
+    /**
+     * Serializes a row into a byte array.
+     *
+     * @param row The row to serialize
+     * @return The serialized row as a byte array
+     */
+    private byte[] serializeRow(Map<String, Object> row) throws IOException {
+        com.fasterxml.jackson.databind.ObjectMapper mapper = new com.fasterxml.jackson.databind.ObjectMapper();
+        return mapper.writeValueAsBytes(row);
     }
 } 
