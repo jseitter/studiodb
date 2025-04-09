@@ -9,6 +9,13 @@ StudioDB is a simplified relational database system designed for educational pur
 - B-Tree indexing
 - Basic SQL query processing
 
+## Documentation
+
+Detailed documentation about StudioDB's internals can be found in the `docs` directory:
+
+- [Storage Subsystem Specification](docs/STORAGE_SPECIFICATION.md) - Detailed information about the storage architecture, page layouts, and tablespace container structures
+- [Startup Specification](docs/STARTUP_SPECIFICATION.md) - Information about the database startup sequence
+
 ## Features
 
 - **Storage Layer**: Page-based storage with tablespaces and storage containers
@@ -114,6 +121,7 @@ SELECT * FROM SYS_INDEX_COLUMNS; View all index columns in the system catalog
 ```
 SHOW BUFFERPOOLS;              Display buffer pool usage information
 SHOW STATISTICS;               Show detailed page allocation and buffer pool stats
+SHOW PAGES;                    Display detailed page information for a tablespace
 ```
 
 ### Supported Data Types
