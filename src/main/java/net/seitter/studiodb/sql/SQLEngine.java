@@ -944,32 +944,69 @@ public class SQLEngine {
                     
                     if (page != null) {
                         // Use PageLayoutFactory to get the appropriate layout for this page
-                        PageLayout layout = PageLayoutFactory.createLayout(page);
+                        PageLayout layout = null;
                         
-                        if (layout != null) {
-                            // Get page information from the layout
-                            int nextPageId = layout.getNextPageId();
-                            int prevPageId = layout.getPrevPageId();
-                            int freeSpace = layout.getFreeSpace();
-                            String additionalInfo = getAdditionalPageInfoFromLayout(layout);
+                        try {
+                            layout = PageLayoutFactory.createLayout(page);
                             
-                            // For Table Data layout, we need to get the prev page ID
-                            PageType pageType = layout.getPageType();
-                            
-                            sb.append(String.format("%-10d %-20s %-15d %-15d %-15d %-20s\n", 
-                                    pageNum, pageType.toString(), nextPageId, prevPageId, freeSpace, additionalInfo));
-                        } else {
-                            // If no layout could be created, the page is likely uninitialized or corrupt
+                            if (layout != null) {
+                                try {
+                                    // Get page information from the layout
+                                    int nextPageId = layout.getNextPageId();
+                                    int prevPageId = layout.getPrevPageId();
+                                    int freeSpace = layout.getFreeSpace();
+                                    PageType pageType = layout.getPageType();
+                                    
+                                    String additionalInfo = ""; 
+                                    try {
+                                        additionalInfo = getAdditionalPageInfoFromLayout(layout);
+                                    } catch (Exception e) {
+                                        logger.error("Error getting additional info for page " + pageNum, e);
+                                        additionalInfo = "Error: " + e.getClass().getSimpleName() + 
+                                            (e.getMessage() != null ? ": " + e.getMessage() : "");
+                                    }
+                                    
+                                    sb.append(String.format("%-10d %-20s %-15d %-15d %-15d %-20s\n", 
+                                            pageNum, pageType.toString(), nextPageId, prevPageId, freeSpace, additionalInfo));
+                                } catch (Exception e) {
+                                    logger.error("Error reading layout values for page " + pageNum, e);
+                                    sb.append(String.format("%-10d %-20s %-15s %-15s %-15s %-20s\n", 
+                                            pageNum, "LAYOUT_ERROR", "N/A", "N/A", "N/A", 
+                                            "Error: " + e.getClass().getSimpleName() + 
+                                            (e.getMessage() != null ? ": " + e.getMessage() : "")));
+                                }
+                            } else {
+                                // Try to check just the page type byte
+                                int typeId = page.getBuffer().get(0) & 0xFF;
+                                String typeInfo = "Unknown type: " + typeId;
+                                try {
+                                    PageType type = PageType.fromTypeId(typeId);
+                                    typeInfo = "Type: " + type + ", invalid header";
+                                } catch (Exception e) {
+                                    // Ignore
+                                }
+                                
+                                // If no layout could be created, the page is likely uninitialized or corrupt
+                                sb.append(String.format("%-10d %-20s %-15s %-15s %-15s %-20s\n", 
+                                        pageNum, "UNKNOWN/CORRUPT", "N/A", "N/A", "N/A", typeInfo));
+                            }
+                        } catch (Exception e) {
+                            logger.error("Error creating layout for page " + pageNum, e);
                             sb.append(String.format("%-10d %-20s %-15s %-15s %-15s %-20s\n", 
-                                    pageNum, "UNKNOWN/CORRUPT", "N/A", "N/A", "N/A", ""));
+                                    pageNum, "CREATE_LAYOUT_ERROR", "N/A", "N/A", "N/A", 
+                                    "Error: " + e.getClass().getSimpleName() + 
+                                    (e.getMessage() != null ? ": " + e.getMessage() : "")));
                         }
                     } else {
                         sb.append(String.format("%-10d %-20s %-15s %-15s %-15s %-20s\n", 
                                 pageNum, "UNALLOCATED", "N/A", "N/A", "N/A", ""));
                     }
                 } catch (Exception e) {
+                    logger.error("Error processing page " + pageNum, e);
                     sb.append(String.format("%-10d %-20s %-15s %-15s %-15s %-20s\n", 
-                            pageNum, "ERROR", "N/A", "N/A", "N/A", e.getMessage()));
+                            pageNum, "PAGE_ACCESS_ERROR", "N/A", "N/A", "N/A", 
+                            "Error: " + e.getClass().getSimpleName() + 
+                            (e.getMessage() != null ? ": " + e.getMessage() : "")));
                 } finally {
                     // Unpin the page if it was pinned
                     if (pinned && page != null) {

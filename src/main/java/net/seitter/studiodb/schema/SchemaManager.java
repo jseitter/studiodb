@@ -267,6 +267,7 @@ public class SchemaManager {
             Page firstDataPage = bufferPool.allocatePage();
             if (firstDataPage == null) {
                 logger.error("Failed to allocate first data page for system table '{}'", tableName);
+                bufferPool.unpinPage(headerPage.getPageId(), true); // Make sure to unpin the header page
                 return null;
             }
             
@@ -276,9 +277,23 @@ public class SchemaManager {
             // Update the header page with the first data page ID
             updateHeaderPageWithFirstDataPageId(headerPage.getPageId(), firstDataPage.getPageId().getPageNumber(), bufferPool);
             
+            // Store data page ID in the table object for redundancy
+            table.setFirstDataPageId(firstDataPage.getPageId().getPageNumber());
+            
+            // Unpin the data page, marking it as dirty to flush changes
+            bufferPool.unpinPage(firstDataPage.getPageId(), true);
+            
             // Store the table in our schema
             tables.put(tableName, table);
             tableIndexes.put(tableName, new ArrayList<>());
+            
+            // Force a flush to make sure all changes are written to disk
+            try {
+                bufferPool.flushAll();
+                logger.debug("Flushed all changes after creating system table '{}'", tableName);
+            } catch (IOException e) {
+                logger.warn("Failed to flush buffer pool after creating system table '{}': {}", tableName, e.getMessage());
+            }
             
             logger.info("Created system table '{}' in tablespace '{}'", tableName, SYSTEM_TABLESPACE);
             return table;
@@ -461,6 +476,118 @@ public class SchemaManager {
     }
     
     /**
+     * Verifies and fixes page header values to ensure they are within valid ranges.
+     * This is a recovery mechanism for potentially corrupted pages.
+     * 
+     * @param pageId The page ID to check
+     * @param bufferPool The buffer pool to use
+     * @return true if verification was successful, false if page could not be repaired
+     * @throws IOException if there is an error accessing the tablespace
+     */
+    private boolean verifyAndFixPageHeader(PageId pageId, IBufferPoolManager bufferPool) throws IOException {
+        Page page = bufferPool.fetchPage(pageId);
+        if (page == null) {
+            logger.error("Failed to fetch page {} for verification", pageId);
+            return false;
+        }
+        
+        try {
+            ByteBuffer buffer = page.getBuffer();
+            
+            // Check the page type
+            int typeId = buffer.get(0) & 0xFF;
+            
+            // If this is a TableHeaderPage (typeId = 1), check specific fields
+            if (typeId == 1) { // 1 = TABLE_HEADER
+                // Check magic number
+                int magic = buffer.getInt(1);
+                if (magic != PageLayout.MAGIC_NUMBER) {
+                    logger.error("Invalid magic number in page {}: 0x{} (should be 0x{})", 
+                        pageId, Integer.toHexString(magic), Integer.toHexString(PageLayout.MAGIC_NUMBER));
+                    
+                    // Fix the magic number
+                    buffer.putInt(1, PageLayout.MAGIC_NUMBER);
+                    page.markDirty();
+                }
+                
+                // Check first data page ID
+                int headerSize = PageLayout.HEADER_SIZE;
+                int firstDataPageOffset = headerSize;
+                int firstDataPageId = buffer.getInt(firstDataPageOffset);
+                
+                try {
+                    Tablespace tablespace = dbSystem.getStorageManager().getTablespace(pageId.getTablespaceName());
+                    int totalPages = tablespace.getTotalPages();
+                    
+                    // If the first data page ID is invalid, reset it
+                    if (firstDataPageId < -1 || firstDataPageId >= totalPages) {
+                        logger.error("Invalid first data page ID in page {}: {} (valid range is -1 to {})", 
+                            pageId, firstDataPageId, totalPages - 1);
+                        
+                        // Reset to invalid (-1)
+                        buffer.putInt(firstDataPageOffset, -1);
+                        page.markDirty();
+                    }
+                } catch (IOException e) {
+                    logger.error("Failed to get tablespace information: {}", e.getMessage());
+                }
+                
+                // Check table name length
+                int tableNameLengthOffset = firstDataPageOffset + 4;
+                int tableNameLength = buffer.getShort(tableNameLengthOffset) & 0xFFFF;
+                
+                if (tableNameLength < 0 || tableNameLength > 255) {
+                    logger.error("Invalid table name length in page {}: {} (valid range is 0 to 255)", 
+                        pageId, tableNameLength);
+                    
+                    // Reset to empty name
+                    buffer.putShort(tableNameLengthOffset, (short) 0);
+                    page.markDirty();
+                }
+            }
+            
+            // If this is a TableDataPage (typeId = 2), check specific fields
+            if (typeId == 2) { // 2 = TABLE_DATA
+                // Check magic number
+                int magic = buffer.getInt(1);
+                if (magic != PageLayout.MAGIC_NUMBER) {
+                    logger.error("Invalid magic number in page {}: 0x{} (should be 0x{})", 
+                        pageId, Integer.toHexString(magic), Integer.toHexString(PageLayout.MAGIC_NUMBER));
+                    
+                    // Fix the magic number
+                    buffer.putInt(1, PageLayout.MAGIC_NUMBER);
+                    page.markDirty();
+                }
+                
+                // Check next page ID
+                int nextPageId = buffer.getInt(5);
+                try {
+                    Tablespace tablespace = dbSystem.getStorageManager().getTablespace(pageId.getTablespaceName());
+                    int totalPages = tablespace.getTotalPages();
+                    
+                    if (nextPageId != -1 && (nextPageId < 0 || nextPageId >= totalPages)) {
+                        logger.error("Invalid next page ID in page {}: {} (valid range is -1 or 0 to {})", 
+                            pageId, nextPageId, totalPages - 1);
+                        
+                        // Reset to no next page
+                        buffer.putInt(5, -1);
+                        page.markDirty();
+                    }
+                } catch (IOException e) {
+                    logger.error("Failed to get tablespace information: {}", e.getMessage());
+                }
+            }
+            
+            bufferPool.unpinPage(pageId, page.isDirty());
+            return true;
+        } catch (Exception e) {
+            logger.error("Exception during page verification: {}", e.getMessage());
+            bufferPool.unpinPage(pageId, false);
+            return false;
+        }
+    }
+    
+    /**
      * Inserts a row into a system table.
      * This is a simplified implementation for educational purposes.
      *
@@ -468,35 +595,53 @@ public class SchemaManager {
      * @param row The row to insert
      */
     private void insertIntoSystemTable(String tableName, Map<String, Object> row) {
+        // Get the system table object
+        Table table = tables.get(tableName);
+        if (table == null) {
+            logger.error("Cannot insert into system table '{}': table not found", tableName);
+            return;
+        }
+        
         try {
-            // Get the table object
-            Table table = tables.get(tableName);
-            if (table == null) {
-                logger.error("Cannot insert into table '{}': table not found", tableName);
-                return;
-            }
-            
-            // Get the buffer pool for the system tablespace
+            // Get a buffer pool for the SYSTEM tablespace
             IBufferPoolManager bufferPool = dbSystem.getBufferPoolManager(SYSTEM_TABLESPACE);
             if (bufferPool == null) {
-                logger.error("Cannot insert into table '{}': buffer pool for system tablespace not found", tableName);
+                logger.error("Cannot insert into system table '{}': buffer pool not found for SYSTEM tablespace", tableName);
                 return;
             }
             
-            // Get the header page
-            PageId headerPageId = new PageId(SYSTEM_TABLESPACE, table.getHeaderPageId());
+            // Validate the row data
+            if (!table.validateRow(row)) {
+                logger.error("Cannot insert into system table '{}': invalid row data", tableName);
+                return;
+            }
+            
+            // Get the header page ID to read the first data page ID
+            int headerPageNumber = table.getHeaderPageId();
+            PageId headerPageId = new PageId(SYSTEM_TABLESPACE, headerPageNumber);
+            
+            // Verify and fix page header if necessary
+            if (!verifyAndFixPageHeader(headerPageId, bufferPool)) {
+                logger.error("Cannot insert into system table '{}': header page verification failed", tableName);
+                return;
+            }
+            
+            // Fetch the header page
             Page headerPage = bufferPool.fetchPage(headerPageId);
             if (headerPage == null) {
-                logger.error("Cannot insert into table '{}': header page not found", tableName);
+                logger.error("Cannot insert into system table '{}': header page not found", tableName);
                 return;
             }
             
-            // Use TableHeaderPageLayout to access header page information
+            // Create a TableHeaderPageLayout to access the header data
             TableHeaderPageLayout headerLayout = new TableHeaderPageLayout(headerPage);
-            int firstDataPageId = headerLayout.getFirstDataPageId();
             
-            // Log the first data page ID for debugging
-            logger.debug("First data page ID for table '{}' is {}", tableName, firstDataPageId);
+            // Log debug information
+            logger.debug("Header page for table '{}': ID={}, TableName={}, FirstDataPageId={}", 
+                    tableName, headerPageId.getPageNumber(), headerLayout.getTableName(), headerLayout.getFirstDataPageId());
+            
+            // Get the first data page ID
+            int firstDataPageId = headerLayout.getFirstDataPageId();
             
             // Verify the first data page ID is valid
             try {
@@ -512,6 +657,10 @@ public class SchemaManager {
                     if (table.getFirstDataPageId() > 0 && table.getFirstDataPageId() < totalPages) {
                         firstDataPageId = table.getFirstDataPageId();
                         logger.info("Using first data page ID {} from table object instead", firstDataPageId);
+                        
+                        // Update the header page with the correct first data page ID
+                        headerLayout.setFirstDataPageId(firstDataPageId);
+                        headerPage.markDirty();
                     } else {
                         // If we can't find a valid page, we'll need to allocate a new one
                         logger.info("Allocating a new data page for table '{}'", tableName);
@@ -546,9 +695,6 @@ public class SchemaManager {
                 bufferPool.unpinPage(headerPageId, false);
                 return;
             }
-            
-            // Unpin the header page as we're done reading from it
-            bufferPool.unpinPage(headerPageId, true);
             
             // Serialize the row data first to know its size
             byte[] rowData = serializeRow(row);
@@ -825,7 +971,7 @@ public class SchemaManager {
     }
     
     /**
-     * Initializes a table header page.
+     * Initializes a header page for a table.
      *
      * @param headerPage The header page to initialize
      * @param table The table information
@@ -839,50 +985,21 @@ public class SchemaManager {
         // Set table name
         headerLayout.setTableName(table.getName());
         
-        // Set column count and information by writing directly to the buffer
-        ByteBuffer buffer = headerPage.getBuffer();
-        buffer.position(21); // Skip page layout header (HEADER_SIZE is protected)
-        
-        // Write table name (already set by the layout method)
-        buffer.putShort((short) table.getName().length());
-        for (int i = 0; i < table.getName().length(); i++) {
-            buffer.putChar(table.getName().charAt(i));
-        }
-        
-        // Write tablespace name
-        buffer.putShort((short) table.getTablespaceName().length());
-        for (int i = 0; i < table.getTablespaceName().length(); i++) {
-            buffer.putChar(table.getTablespaceName().charAt(i));
-        }
-        
-        // Write column count
-        buffer.putInt(table.getColumns().size());
-        
-        // Write column information
+        // Add all columns to the header layout
         for (Column column : table.getColumns()) {
-            // Write column name
-            buffer.putShort((short) column.getName().length());
-            for (int i = 0; i < column.getName().length(); i++) {
-                buffer.putChar(column.getName().charAt(i));
-            }
-            
-            // Write column type
-            buffer.putInt(column.getDataType().ordinal());
-            
-            // Write nullable flag
-            buffer.put(column.isNullable() ? (byte)1 : (byte)0);
-            
-            // Write max length for VARCHAR
-            if (column.getDataType() == DataType.VARCHAR) {
-                buffer.putInt(column.getMaxLength());
-            }
-            
-            // Write primary key flag
-            buffer.put(table.getPrimaryKey().contains(column.getName()) ? (byte)1 : (byte)0);
+            headerLayout.addColumn(
+                column.getName(),
+                column.getDataType(),
+                column.getMaxLength(),
+                column.isNullable()
+            );
         }
         
-        // Mark the page as dirty
+        // Mark the page as dirty to ensure changes are persisted
         headerPage.markDirty();
+        
+        logger.debug("Initialized table header page for table '{}' with {} columns", 
+                table.getName(), table.getColumns().size());
     }
     
     /**
@@ -901,14 +1018,15 @@ public class SchemaManager {
         }
         
         try {
-            ByteBuffer buffer = headerPage.getBuffer();
-            buffer.position(25); // Skip header (21) and column count (4)
+            // Create the header page layout for proper object-oriented access
+            TableHeaderPageLayout headerLayout = new TableHeaderPageLayout(headerPage);
             
-            // Write first data page ID
-            buffer.putInt(firstDataPageId);
+            // Update the first data page ID through the layout class
+            headerLayout.setFirstDataPageId(firstDataPageId);
             
-            // Mark the page as dirty
-            headerPage.markDirty();
+            // The page is marked dirty by the layout method
+            logger.debug("Updated first data page ID to {} for header page {}", 
+                    firstDataPageId, headerPageId);
         } finally {
             bufferPool.unpinPage(headerPageId, true);
         }
@@ -921,11 +1039,20 @@ public class SchemaManager {
      * @throws IOException If there's an error writing the page
      */
     private void initializeTableDataPage(Page dataPage) throws IOException {
-        // Create a table data page layout
-        PageLayout dataLayout = PageLayoutFactory.createNewPage(dataPage.getPageId(), dataPage.getPageSize(), PageType.TABLE_DATA);
+        // Create a table data page layout directly
+        TableDataPageLayout dataLayout = new TableDataPageLayout(dataPage);
         
         // Initialize the page layout
         dataLayout.initialize();
+        
+        // Mark the page as dirty to ensure changes are persisted
+        dataPage.markDirty();
+        
+        // Set the first data page ID in the table object if applicable
+        if (dataPage.getPageId() != null) {
+            logger.debug("Initialized table data page {} with type {}", 
+                    dataPage.getPageId().getPageNumber(), PageType.TABLE_DATA);
+        }
     }
     
     /**
