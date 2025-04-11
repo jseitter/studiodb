@@ -172,7 +172,8 @@ public class StorageContainer {
         buffer.put((byte) SchemaManager.PAGE_TYPE_FREE_SPACE_MAP);
         
         // Write magic number for free space map
-        buffer.putInt(SchemaManager.MAGIC_CONTAINER_METADATA);
+        // Since there's no specific magic number for free space map in SchemaManager, use the default
+        buffer.putInt(0xDADADADA);
         
         // Last page checked (starts at 1 which is the free space map page)
         buffer.putInt(1);
@@ -212,7 +213,11 @@ public class StorageContainer {
      * @throws IOException If there's an error updating the free space map
      */
     private void markPagesAsFree(int startPage, int endPage) throws IOException {
-        if (startPage < 2) startPage = 2; // Pages 0 and 1 are never free
+        // if we get a wrong argument we shall abort
+        if (startPage < 2) {
+            logger.error("Cannot mark page {} as free - it's a reserved page", startPage);
+            return;
+        }
         
         Page freeSpaceMapPage = readPage(1);
         if (freeSpaceMapPage == null) {
@@ -260,8 +265,12 @@ public class StorageContainer {
      * @throws IOException If there's an error updating the free space map
      */
     private void markPageAsUsed(int pageNum) throws IOException {
-        if (pageNum < 2) return; // Pages 0 and 1 are always in use
-        
+        // if we get a wrong argument we shall abort
+        if (pageNum < 2) {
+            logger.error("Cannot mark page {} as used - it's a reserved page", pageNum);
+            return;
+        }
+       // read the free space map page
         Page freeSpaceMapPage = readPage(1);
         if (freeSpaceMapPage == null) {
             logger.error("Failed to read free space map page");

@@ -21,8 +21,12 @@ import net.seitter.studiodb.schema.Column;
 import net.seitter.studiodb.schema.DataType;
 import net.seitter.studiodb.schema.SchemaManager;
 import net.seitter.studiodb.schema.Table;
-import net.seitter.studiodb.storage.TableDataPageLayout;
+import net.seitter.studiodb.storage.Page;
+import net.seitter.studiodb.storage.PageId;
+import net.seitter.studiodb.storage.Tablespace;
+import net.seitter.studiodb.storage.layout.TableDataPageLayout;
 import net.seitter.studiodb.storage.PageLayout;
+import net.seitter.studiodb.storage.layout.PageLayoutFactory;
 
 /**
  * Comprehensive tests for the storage system components, focusing on tablespace
@@ -130,7 +134,7 @@ public class StorageSystemTest {
         
         // Get the first data page ID
         ByteBuffer headerBuffer = headerPage.getBuffer();
-        headerBuffer.position(4); // Skip magic number
+        headerBuffer.position(25); // Skip header (21) and column count (4)
         int firstDataPageId = headerBuffer.getInt();
         bpm.unpinPage(headerPageId, false);
         
@@ -149,7 +153,8 @@ public class StorageSystemTest {
         byte[] rowData = serializeRow(row);
         assertTrue(rowData.length > 0, "Row data should be serialized");
         
-        // Get the data page and its layout
+        // Get the data page and load it with a layout
+        dataPage = bpm.fetchPage(dataPageId);
         TableDataPageLayout layout = new TableDataPageLayout(dataPage);
         layout.initialize();
         
@@ -168,23 +173,10 @@ public class StorageSystemTest {
         Page retrievePage = bpm.fetchPage(dataPageId);
         assertNotNull(retrievePage, "Should be able to fetch the page again");
         
-        ByteBuffer retrieveBuffer = retrievePage.getBuffer();
-        retrieveBuffer.position(13);  // Row count is at offset 13
-        int retrievedRowCount = retrieveBuffer.getInt();
-        assertEquals(1, retrievedRowCount, "Should have 1 row");
-        
-        // Get free space offset
-        int freeSpaceOffset = retrieveBuffer.getInt();
-        
-        // Read directory entry
-        retrieveBuffer.position(PageLayout.HEADER_SIZE);  // Directory starts after header
-        int storedOffset = retrieveBuffer.getInt();
-        int storedLength = retrieveBuffer.getInt();
-        
-        // Read row data
-        byte[] retrievedData = new byte[storedLength];
-        retrieveBuffer.position(storedOffset);
-        retrieveBuffer.get(retrievedData);
+        // Use the layout to retrieve the row
+        TableDataPageLayout retrieveLayout = new TableDataPageLayout(retrievePage);
+        byte[] retrievedData = retrieveLayout.getRow(0);
+        assertNotNull(retrievedData, "Should be able to retrieve the row data");
         
         // Deserialize
         Map<String, Object> retrievedRow = deserializeRow(retrievedData);

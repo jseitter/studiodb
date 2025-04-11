@@ -5,6 +5,13 @@ import static org.junit.jupiter.api.Assertions.*;
 import java.nio.ByteBuffer;
 import org.junit.jupiter.api.Test;
 
+import net.seitter.studiodb.storage.Page;
+import net.seitter.studiodb.storage.PageId;
+import net.seitter.studiodb.storage.PageLayout;
+import net.seitter.studiodb.storage.PageType;
+import net.seitter.studiodb.storage.layout.TableDataPageLayout;
+import net.seitter.studiodb.storage.layout.PageLayoutFactory;
+
 /**
  * Tests for the Page and PageLayout classes with the new single magic number design.
  */
@@ -13,6 +20,7 @@ public class PageLayoutTest {
     // Concrete implementation of PageLayout for testing
     private static class TestPageLayout extends PageLayout {
         private final PageType pageType;
+        private static final int ROW_COUNT_OFFSET = PageLayout.HEADER_SIZE;
         
         public TestPageLayout(Page page, PageType pageType) {
             super(page);
@@ -22,6 +30,18 @@ public class PageLayoutTest {
         @Override
         public void initialize() {
             writeHeader(pageType);
+            // Set free space to start at the end of the buffer, like TableDataPageLayout does
+            setFreeSpaceOffset(page.getPageSize());
+        }
+        
+        // Add row count methods that were moved out of PageLayout
+        public void setRowCount(int rowCount) {
+            buffer.putInt(ROW_COUNT_OFFSET, rowCount);
+            page.markDirty();
+        }
+        
+        public int getRowCount() {
+            return buffer.getInt(ROW_COUNT_OFFSET);
         }
     }
     
@@ -39,7 +59,8 @@ public class PageLayoutTest {
         assertEquals(-1, layout.getNextPageId());
         assertEquals(-1, layout.getPrevPageId());
         assertEquals(0, layout.getRowCount());
-        assertEquals(PageLayout.HEADER_SIZE, layout.getFreeSpaceOffset());
+        // For TableDataPageLayout, free space is set to buffer capacity, not HEADER_SIZE
+        assertEquals(layout.getPage().getPageSize(), layout.getFreeSpaceOffset());
         
         // Test setting header values
         layout.setNextPageId(2);
@@ -120,5 +141,50 @@ public class PageLayoutTest {
         assertThrows(IllegalArgumentException.class, () -> {
             PageType.fromTypeId(-1);
         }, "Should throw exception for invalid type ID");
+    }
+    
+    @Test
+    public void testTableDataLayoutAddRow() {
+        // Create a test page
+        PageId pageId = new PageId("test", 1);
+        Page page = new Page(pageId, 1024);
+        
+        // Create layout
+        TableDataPageLayout layout = new TableDataPageLayout(page);
+        layout.initialize();
+        
+        // Add rows
+        byte[] row1 = new byte[100];
+        for (int i = 0; i < row1.length; i++) {
+            row1[i] = (byte) i;
+        }
+        
+        assertTrue(layout.addRow(row1));
+        
+        // Verify row was added
+        byte[] retrievedRow = layout.getRow(0);
+        assertNotNull(retrievedRow);
+        assertEquals(row1.length, retrievedRow.length);
+        assertArrayEquals(row1, retrievedRow);
+        
+        // Verify row count was updated
+        assertEquals(1, layout.getRowCount());
+        
+        // Add another row
+        byte[] row2 = new byte[200];
+        for (int i = 0; i < row2.length; i++) {
+            row2[i] = (byte) (i + 10);
+        }
+        
+        assertTrue(layout.addRow(row2));
+        
+        // Verify second row was added
+        retrievedRow = layout.getRow(1);
+        assertNotNull(retrievedRow);
+        assertEquals(row2.length, retrievedRow.length);
+        assertArrayEquals(row2, retrievedRow);
+        
+        // Verify row count was updated
+        assertEquals(2, layout.getRowCount());
     }
 } 

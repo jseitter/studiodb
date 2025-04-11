@@ -1,9 +1,12 @@
-package net.seitter.studiodb.storage;
+package net.seitter.studiodb.storage.layout;
 
 import net.seitter.studiodb.schema.DataType;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.List;
+import net.seitter.studiodb.storage.Page;
+import net.seitter.studiodb.storage.PageLayout;
+import net.seitter.studiodb.storage.PageType;
 
 /**
  * Layout class for B-tree index pages.

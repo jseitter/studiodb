@@ -1,6 +1,9 @@
-package net.seitter.studiodb.storage;
+package net.seitter.studiodb.storage.layout;
 
 import net.seitter.studiodb.schema.DataType;
+import net.seitter.studiodb.storage.Page;
+import net.seitter.studiodb.storage.PageLayout;
+import net.seitter.studiodb.storage.PageType;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.List;
@@ -10,10 +13,10 @@ import java.util.List;
  * Handles the specific structure and operations for table header pages.
  */
 public class TableHeaderPageLayout extends PageLayout {
-    private static final int TABLE_NAME_OFFSET = 5; // After page type and magic
-    private static final int TABLE_NAME_LENGTH_OFFSET = 9; // After first data page ID
-    private static final int TABLE_NAME_START_OFFSET = 11; // After name length
-    private static final int COLUMN_COUNT_OFFSET = 11; // After table name
+    // Offsets for various fields in the header page
+    private static final int FIRST_DATA_PAGE_ID_OFFSET = HEADER_SIZE; // Immediately after header
+    private static final int TABLE_NAME_LENGTH_OFFSET = FIRST_DATA_PAGE_ID_OFFSET + 4; // After first data page ID (4 bytes)
+    private static final int TABLE_NAME_START_OFFSET = TABLE_NAME_LENGTH_OFFSET + 2; // After name length (2 bytes)
     
     public TableHeaderPageLayout(Page page) {
         super(page);
@@ -24,6 +27,12 @@ public class TableHeaderPageLayout extends PageLayout {
      */
     public void initialize() {
         writeHeader(PageType.TABLE_HEADER);
+        // Initialize first data page ID to -1 (invalid)
+        setFirstDataPageId(-1);
+        // Initialize table name to empty string
+        setTableName("");
+        // Initialize column count to 0
+        setColumnCount(0);
     }
     
     /**
@@ -32,7 +41,7 @@ public class TableHeaderPageLayout extends PageLayout {
      * @param firstDataPageId The ID of the first data page
      */
     public void setFirstDataPageId(int firstDataPageId) {
-        buffer.putInt(TABLE_NAME_OFFSET, firstDataPageId);
+        buffer.putInt(FIRST_DATA_PAGE_ID_OFFSET, firstDataPageId);
         page.markDirty();
     }
     
@@ -42,7 +51,7 @@ public class TableHeaderPageLayout extends PageLayout {
      * @return The ID of the first data page
      */
     public int getFirstDataPageId() {
-        return buffer.getInt(TABLE_NAME_OFFSET);
+        return buffer.getInt(FIRST_DATA_PAGE_ID_OFFSET);
     }
     
     /**
@@ -51,6 +60,10 @@ public class TableHeaderPageLayout extends PageLayout {
      * @param tableName The name of the table
      */
     public void setTableName(String tableName) {
+        if (tableName == null) {
+            tableName = "";
+        }
+        
         // Write name length (2 bytes)
         buffer.putShort(TABLE_NAME_LENGTH_OFFSET, (short) tableName.length());
         
@@ -71,8 +84,8 @@ public class TableHeaderPageLayout extends PageLayout {
      */
     public String getTableName() {
         int nameLength = buffer.getShort(TABLE_NAME_LENGTH_OFFSET) & 0xFFFF;
-        if (nameLength == 0 || nameLength > 128) {
-            return null;
+        if (nameLength == 0) {
+            return "";
         }
         
         StringBuilder name = new StringBuilder(nameLength);
@@ -86,14 +99,24 @@ public class TableHeaderPageLayout extends PageLayout {
     }
     
     /**
+     * Gets the offset where column count is stored.
+     * This is calculated based on the table name length.
+     * 
+     * @return The offset for column count
+     */
+    private int getColumnCountOffset() {
+        int nameLength = buffer.getShort(TABLE_NAME_LENGTH_OFFSET) & 0xFFFF;
+        return TABLE_NAME_START_OFFSET + (nameLength * 2);
+    }
+    
+    /**
      * Sets the number of columns.
      * 
      * @param columnCount The number of columns
      */
     public void setColumnCount(int columnCount) {
-        int nameLength = buffer.getShort(TABLE_NAME_LENGTH_OFFSET) & 0xFFFF;
-        int columnCountOffset = TABLE_NAME_START_OFFSET + (nameLength * 2);
-        buffer.putShort(columnCountOffset, (short) columnCount);
+        int offset = getColumnCountOffset();
+        buffer.putShort(offset, (short) columnCount);
         page.markDirty();
     }
     
@@ -103,9 +126,18 @@ public class TableHeaderPageLayout extends PageLayout {
      * @return The number of columns
      */
     public int getColumnCount() {
-        int nameLength = buffer.getShort(TABLE_NAME_LENGTH_OFFSET) & 0xFFFF;
-        int columnCountOffset = TABLE_NAME_START_OFFSET + (nameLength * 2);
-        return buffer.getShort(columnCountOffset) & 0xFFFF;
+        int offset = getColumnCountOffset();
+        return buffer.getShort(offset) & 0xFFFF;
+    }
+    
+    /**
+     * Gets the offset where column definitions start.
+     * This is after the column count.
+     * 
+     * @return The starting offset for column definitions
+     */
+    private int getColumnsStartOffset() {
+        return getColumnCountOffset() + 2; // After column count (2 bytes)
     }
     
     /**
@@ -117,11 +149,21 @@ public class TableHeaderPageLayout extends PageLayout {
      * @param nullable Whether the column is nullable
      */
     public void addColumn(String name, DataType dataType, int maxLength, boolean nullable) {
-        int nameLength = buffer.getShort(TABLE_NAME_LENGTH_OFFSET) & 0xFFFF;
+        if (name == null) {
+            name = "";
+        }
+        
         int columnCount = getColumnCount();
         
+        // Calculate size of existing column definitions
+        int columnsSize = 0;
+        for (ColumnDefinition col : getColumns()) {
+            // 2 bytes for name length + (name.length * 2) for name chars + 1 byte for type + 2 bytes for maxLength + 1 byte for nullable
+            columnsSize += 2 + (col.getName().length() * 2) + 4;
+        }
+        
         // Calculate offset for new column
-        int columnOffset = TABLE_NAME_START_OFFSET + (nameLength * 2) + 2 + (columnCount * 12);
+        int columnOffset = getColumnsStartOffset() + columnsSize;
         
         // Write column name length (2 bytes)
         buffer.putShort(columnOffset, (short) name.length());
@@ -157,10 +199,9 @@ public class TableHeaderPageLayout extends PageLayout {
      */
     public List<ColumnDefinition> getColumns() {
         List<ColumnDefinition> columns = new ArrayList<>();
-        int nameLength = buffer.getShort(TABLE_NAME_LENGTH_OFFSET) & 0xFFFF;
         int columnCount = getColumnCount();
         
-        int pos = TABLE_NAME_START_OFFSET + (nameLength * 2) + 2;
+        int pos = getColumnsStartOffset();
         
         for (int i = 0; i < columnCount; i++) {
             // Read column name length

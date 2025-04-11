@@ -7,12 +7,19 @@ import java.nio.ByteBuffer;
  * Provides common functionality for reading and writing page headers.
  */
 public abstract class PageLayout {
-    protected static final int HEADER_SIZE = 21; // Common header size for most page types
-    protected static final int MAGIC_NUMBER = 0xDADADADA; // Single magic number for all pages
-    
+    // the header is fixed size for all page types
+    // 32 bytes to keep some space for extensions
+    protected static final int HEADER_SIZE = 32;
+    // Magic number is a constant value used to identify valid pages
+    final int MAGIC_NUMBER = 0xDADADADA;
+ 
+   
+    // the page is the page that this layout is working on      
     protected final Page page;
+    // the buffer is the buffer of the page that this layout is working on
     protected final ByteBuffer buffer;
-    
+   
+    // constructor takes a page and initializes the buffer
     protected PageLayout(Page page) {
         this.page = page;
         this.buffer = page.getBuffer();
@@ -26,8 +33,12 @@ public abstract class PageLayout {
     
     /**
      * Writes the common page header.
-     * Format: [Page Type (1 byte)] [Magic Number (4 bytes)] [Next Page ID (4 bytes)] [Prev Page ID (4 bytes)]
-     *         [Number of Rows (4 bytes)] [Free Space Offset (4 bytes)]
+     * Format: 
+     * [Page Type (1 byte)] 
+     * [Magic Number (4 bytes)] 
+     * [Next Page ID (4 bytes)] 
+     * [Prev Page ID (4 bytes)]
+     * [Free Space Offset (4 bytes)]
      * 
      * @param pageType The type of the page
      */
@@ -37,8 +48,7 @@ public abstract class PageLayout {
         
         // Write page type marker
         buffer.put((byte) pageType.getTypeId());
-        
-        // Write magic number
+       
         buffer.putInt(MAGIC_NUMBER);
         
         // No next page yet
@@ -46,9 +56,6 @@ public abstract class PageLayout {
         
         // No previous page yet
         buffer.putInt(-1);
-        
-        // No rows yet
-        buffer.putInt(0);
         
         // Free space starts after the header
         buffer.putInt(HEADER_SIZE);
@@ -62,19 +69,26 @@ public abstract class PageLayout {
      * @return The page type if valid, null otherwise
      */
     protected PageType readHeader() {
-        if (buffer.limit() < HEADER_SIZE) {
-            return null;
+        if (buffer == null) {
+            throw new IllegalStateException("Buffer is null");
         }
-        
+        if (buffer.limit() < HEADER_SIZE) {
+            throw new IllegalStateException("Buffer size " + buffer.limit() + " is too small for header size " + HEADER_SIZE);
+        }
+        // get the page type
         int typeId = buffer.get(0) & 0xFF;
         int magic = buffer.getInt(1);
-        
+       
         // Validate magic number
         if (magic != MAGIC_NUMBER) {
-            return null;
+            throw new IllegalStateException("Invalid magic number: expected " + 
+                String.format("0x%08X", MAGIC_NUMBER) + ", got " + 
+                String.format("0x%08X", magic));
         }
+         //create the page type
+        PageType pageType = PageType.fromTypeId(typeId);
         
-        return PageType.fromTypeId(typeId);
+        return pageType;
     }
     
     /**
@@ -82,7 +96,7 @@ public abstract class PageLayout {
      * 
      * @return The next page ID, or -1 if none
      */
-    protected int getNextPageId() {
+    public int getNextPageId() {
         return buffer.getInt(5);
     }
     
@@ -118,7 +132,7 @@ public abstract class PageLayout {
      * 
      * @param nextPageId The next page ID
      */
-    protected void setNextPageId(int nextPageId) {
+    public void setNextPageId(int nextPageId) {
         buffer.putInt(5, nextPageId);
         page.markDirty();
     }
@@ -133,16 +147,7 @@ public abstract class PageLayout {
         page.markDirty();
     }
     
-    /**
-     * Sets the number of rows in the header.
-     * 
-     * @param rowCount The number of rows
-     */
-    protected void setRowCount(int rowCount) {
-        buffer.putInt(13, rowCount);
-        page.markDirty();
-    }
-    
+   
     /**
      * Sets the free space offset in the header.
      * 
