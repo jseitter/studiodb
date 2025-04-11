@@ -9,9 +9,9 @@ import java.nio.ByteBuffer;
 public abstract class PageLayout {
     // the header is fixed size for all page types
     // 32 bytes to keep some space for extensions
-    protected static final int HEADER_SIZE = 32;
+    public static final int HEADER_SIZE = 32;
     // Magic number is a constant value used to identify valid pages
-    final int MAGIC_NUMBER = 0xDADADADA;
+    public static final int MAGIC_NUMBER = 0xDADADADA;
  
    
     // the page is the page that this layout is working on      
@@ -105,7 +105,7 @@ public abstract class PageLayout {
      * 
      * @return The previous page ID, or -1 if none
      */
-    protected int getPrevPageId() {
+    public int getPrevPageId() {
         return buffer.getInt(9);
     }
     
@@ -174,5 +174,14 @@ public abstract class PageLayout {
      */
     public int getFreeSpace() {
         return page.getPageSize() - getFreeSpaceOffset();
+    }
+
+    /**
+     * Gets the page type from the header.
+     * 
+     * @return The page type
+     */
+    public PageType getPageType() {
+        return readHeader();
     }
 } 

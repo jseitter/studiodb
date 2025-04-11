@@ -48,6 +48,36 @@ public class FreeSpaceMapPageLayout extends PageLayout {
     }
     
     /**
+     * Writes the free space map page header with the generic magic number.
+     * Since PageLayoutFactory expects the generic MAGIC_NUMBER for free space map pages,
+     * this override exists to ensure compatibility.
+     *
+     * @param pageType The type of the page
+     */
+    @Override
+    protected void writeHeader(PageType pageType) {
+        // Clear the buffer and set position to 0
+        buffer.clear();
+        
+        // Write page type marker
+        buffer.put((byte) pageType.getTypeId());
+        
+        // Use the standard magic number from PageLayout
+        buffer.putInt(PageLayout.MAGIC_NUMBER);
+        
+        // No next page yet
+        buffer.putInt(-1);
+        
+        // No previous page yet
+        buffer.putInt(-1);
+        
+        // Free space starts after the header
+        buffer.putInt(HEADER_SIZE);
+        
+        page.markDirty();
+    }
+    
+    /**
      * Clears the entire bitmap (sets all bytes to 0).
      * This marks all pages as used.
      */

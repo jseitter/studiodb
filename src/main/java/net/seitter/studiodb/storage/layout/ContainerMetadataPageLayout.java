@@ -56,6 +56,35 @@ public class ContainerMetadataPageLayout extends PageLayout {
     }
     
     /**
+     * Writes the container metadata page header with the appropriate magic number.
+     * This overrides the generic writeHeader to use the specific magic number.
+     *
+     * @param pageType The type of the page
+     */
+    @Override
+    protected void writeHeader(PageType pageType) {
+        // Clear the buffer and set position to 0
+        buffer.clear();
+        
+        // Write page type marker
+        buffer.put((byte) pageType.getTypeId());
+        
+        // Use the standard magic number from PageLayout
+        buffer.putInt(PageLayout.MAGIC_NUMBER);
+        
+        // No next page yet
+        buffer.putInt(-1);
+        
+        // No previous page yet
+        buffer.putInt(-1);
+        
+        // Free space starts after the header
+        buffer.putInt(HEADER_SIZE);
+        
+        page.markDirty();
+    }
+    
+    /**
      * Sets the tablespace name.
      * 
      * @param name The name of the tablespace

@@ -41,30 +41,8 @@ public class PageLayoutFactory {
             return null; // Invalid page type
         }
         
-        // Validate magic number based on page type
-        boolean validMagic = false;
-        switch (pageType) {
-            case TABLE_HEADER:
-                validMagic = (magic == SchemaManager.MAGIC_TABLE_HEADER);
-                break;
-            case TABLE_DATA:
-                validMagic = (magic == SchemaManager.MAGIC_TABLE_DATA);
-                break;
-            case INDEX_HEADER:
-            case INDEX_INTERNAL:
-            case INDEX_LEAF:
-                validMagic = (magic == SchemaManager.MAGIC_BTREE_PAGE);
-                break;
-            case CONTAINER_METADATA:
-                validMagic = (magic == SchemaManager.MAGIC_CONTAINER_METADATA);
-                break;
-            default:
-                // For other types, check against the default magic number
-                validMagic = (magic == 0xDADADADA);
-                break;
-        }
-        
-        if (!validMagic) {
+        // Validate magic number - now we use only the standard MAGIC_NUMBER
+        if (magic != PageLayout.MAGIC_NUMBER) {
             return null;
         }
         

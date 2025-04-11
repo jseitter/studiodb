@@ -6,9 +6,12 @@ import net.seitter.studiodb.buffer.IBufferPoolManager;
 import net.seitter.studiodb.storage.Page;
 import net.seitter.studiodb.storage.PageId;
 import net.seitter.studiodb.storage.PageLayout;
-import net.seitter.studiodb.storage.PageLayoutFactory;
 import net.seitter.studiodb.storage.PageType;
-import net.seitter.studiodb.storage.IndexPageLayout;
+import net.seitter.studiodb.storage.layout.PageLayoutFactory;
+import net.seitter.studiodb.storage.layout.IndexPageLayout;
+import net.seitter.studiodb.storage.layout.TableHeaderPageLayout;
+import net.seitter.studiodb.storage.layout.TableDataPageLayout;
+import net.seitter.studiodb.storage.Tablespace;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -503,81 +506,236 @@ public class SchemaManager {
             Page headerPage = bufferPool.fetchPage(headerPageId);
             if (headerPage == null) {
                 logger.error("Cannot insert into table '{}': header page not found", tableName);
+                return;
+            }
+            
+            // Use TableHeaderPageLayout to access header page information
+            TableHeaderPageLayout headerLayout = new TableHeaderPageLayout(headerPage);
+            int firstDataPageId = headerLayout.getFirstDataPageId();
+            
+            // Log the first data page ID for debugging
+            logger.debug("First data page ID for table '{}' is {}", tableName, firstDataPageId);
+            
+            // Verify the first data page ID is valid
+            try {
+                Tablespace tablespace = dbSystem.getStorageManager().getTablespace(SYSTEM_TABLESPACE);
+                int totalPages = tablespace.getTotalPages();
+                
+                if (firstDataPageId < 0 || firstDataPageId >= totalPages) {
+                    // Invalid first data page ID - this could be due to page corruption or inconsistency
+                    logger.error("Invalid first data page ID {} for table '{}' (valid range: 0-{})", 
+                        firstDataPageId, tableName, totalPages - 1);
+                    
+                    // Use a fallback approach - try to find the first data page ID from the table object
+                    if (table.getFirstDataPageId() > 0 && table.getFirstDataPageId() < totalPages) {
+                        firstDataPageId = table.getFirstDataPageId();
+                        logger.info("Using first data page ID {} from table object instead", firstDataPageId);
+                    } else {
+                        // If we can't find a valid page, we'll need to allocate a new one
+                        logger.info("Allocating a new data page for table '{}'", tableName);
+                        Page newDataPage = bufferPool.allocatePage();
+                        if (newDataPage == null) {
+                            logger.error("Failed to allocate new data page for table '{}'", tableName);
+                            bufferPool.unpinPage(headerPageId, false);
+                            return;
+                        }
+                        
+                        // Initialize the data page
+                        TableDataPageLayout newDataLayout = new TableDataPageLayout(newDataPage);
+                        newDataLayout.initialize();
+                        newDataPage.markDirty();
+                        
+                        // Update the header with this new page ID
+                        firstDataPageId = newDataPage.getPageId().getPageNumber();
+                        headerLayout.setFirstDataPageId(firstDataPageId);
+                        headerPage.markDirty();
+                        
+                        // Also update the table object
+                        table.setFirstDataPageId(firstDataPageId);
+                        
+                        // Unpin the new page
+                        bufferPool.unpinPage(newDataPage.getPageId(), true);
+                        
+                        logger.info("Allocated new first data page {} for table '{}'", firstDataPageId, tableName);
+                    }
+                }
+            } catch (IOException e) {
+                logger.error("Error checking tablespace size: {}", e.getMessage());
                 bufferPool.unpinPage(headerPageId, false);
                 return;
             }
             
-            // Get the first data page ID
-            ByteBuffer headerBuffer = headerPage.getBuffer();
-            headerBuffer.position(4); // Skip magic number
-            int firstDataPageId = headerBuffer.getInt();
-            bufferPool.unpinPage(headerPageId, false);
+            // Unpin the header page as we're done reading from it
+            bufferPool.unpinPage(headerPageId, true);
             
-            // Get the data page
-            PageId dataPageId = new PageId(SYSTEM_TABLESPACE, firstDataPageId);
-            Page dataPage = bufferPool.fetchPage(dataPageId);
-            if (dataPage == null) {
-                logger.error("Cannot insert into table '{}': data page not found", tableName);
-                return;
-            }
+            // Serialize the row data first to know its size
+            byte[] rowData = serializeRow(row);
+            logger.debug("Attempting to insert row of {} bytes into table '{}'", rowData.length, tableName);
+            
+            // Try to insert into the first data page or chain of data pages
+            boolean inserted = false;
+            PageId currentDataPageId = new PageId(SYSTEM_TABLESPACE, firstDataPageId);
+            PageId previousDataPageId = null;
+            TableDataPageLayout previousDataLayout = null;
+            
+            // Add extra debugging
+            logger.info("Attempting to insert into first data page {} for table '{}'", firstDataPageId, tableName);
             
             try {
-                // Serialize the row data
-                byte[] rowData = serializeRow(row);
+                Tablespace tablespace = dbSystem.getStorageManager().getTablespace(SYSTEM_TABLESPACE);
+                int totalPages = tablespace.getTotalPages();
                 
-                // Read current row count and free space offset
-                ByteBuffer dataBuffer = dataPage.getBuffer();
-                dataBuffer.position(13); // Skip magic, next page ID, prev page ID, and row count
-                int rowCount = dataBuffer.getInt();
-                int freeSpaceOffset = dataBuffer.getInt();
-                
-                // If this is a new page, initialize free space
-                if (freeSpaceOffset == 16) {
-                    freeSpaceOffset = dataBuffer.capacity();
+                // Try to find a page with enough space for the row
+                while (!inserted) {
+                    // Verify page ID is valid before fetching
+                    int pageNumber = currentDataPageId.getPageNumber();
+                    if (pageNumber < 0 || pageNumber >= totalPages) {
+                        logger.error("Invalid page number {} (valid range: 0-{}), allocating new page", 
+                            pageNumber, totalPages - 1);
+                        
+                        // Allocate a new page
+                        Page newDataPage = bufferPool.allocatePage();
+                        if (newDataPage == null) {
+                            logger.error("Failed to allocate new data page for table '{}'", tableName);
+                            return;
+                        }
+                        
+                        // Initialize the new page
+                        TableDataPageLayout newDataLayout = new TableDataPageLayout(newDataPage);
+                        newDataLayout.initialize();
+                        
+                        // If we have a previous page, link it to this new one
+                        if (previousDataPageId != null) {
+                            Page prevPage = bufferPool.fetchPage(previousDataPageId);
+                            if (prevPage != null) {
+                                TableDataPageLayout prevLayout = new TableDataPageLayout(prevPage);
+                                prevLayout.setNextPageId(newDataPage.getPageId().getPageNumber());
+                                prevPage.markDirty();
+                                bufferPool.unpinPage(previousDataPageId, true);
+                            }
+                        } else {
+                            // This is the first data page, update the table header
+                            PageId tableHeaderPageId = new PageId(SYSTEM_TABLESPACE, table.getHeaderPageId());
+                            Page tableHeaderPage = bufferPool.fetchPage(tableHeaderPageId);
+                            if (tableHeaderPage != null) {
+                                TableHeaderPageLayout tableHeaderLayout = new TableHeaderPageLayout(tableHeaderPage);
+                                tableHeaderLayout.setFirstDataPageId(newDataPage.getPageId().getPageNumber());
+                                tableHeaderPage.markDirty();
+                                bufferPool.unpinPage(tableHeaderPageId, true);
+                                
+                                // Also update the table object
+                                table.setFirstDataPageId(newDataPage.getPageId().getPageNumber());
+                            }
+                        }
+                        
+                        // Try to add the row to the new page
+                        if (newDataLayout.addRow(rowData)) {
+                            inserted = true;
+                            newDataPage.markDirty();
+                            logger.info("Inserted row into table '{}' on new page {}", 
+                                tableName, newDataPage.getPageId());
+                        } else {
+                            logger.error("Failed to add row to new page {} - this should not happen", 
+                                newDataPage.getPageId());
+                        }
+                        
+                        // Unpin the new page
+                        bufferPool.unpinPage(newDataPage.getPageId(), true);
+                        break;
+                    }
+                    
+                    Page dataPage = bufferPool.fetchPage(currentDataPageId);
+                    if (dataPage == null) {
+                        logger.error("Cannot insert into table '{}': data page {} not found", tableName, currentDataPageId);
+                        return;
+                    }
+                    
+                    TableDataPageLayout dataLayout = new TableDataPageLayout(dataPage);
+                    
+                    // Check if there's enough space in this page
+                    if (dataLayout.getFreeSpace() >= rowData.length + TableDataPageLayout.ROW_DIRECTORY_ENTRY_SIZE) {
+                        // Add the row to this page
+                        if (dataLayout.addRow(rowData)) {
+                            inserted = true;
+                            dataPage.markDirty();
+                            bufferPool.unpinPage(currentDataPageId, true);
+                            logger.debug("Inserted row into table '{}' on page {}", tableName, currentDataPageId);
+                        } else {
+                            // If addRow returns false despite our space check, something went wrong
+                            logger.error("Failed to add row to page {} despite space check", currentDataPageId);
+                            bufferPool.unpinPage(currentDataPageId, false);
+                        }
+                    } else {
+                        // Not enough space - check for next page
+                        int nextPageId = dataLayout.getNextPageId();
+                        
+                        if (nextPageId != -1) {
+                            // Move to the next page in the chain
+                            previousDataPageId = currentDataPageId;
+                            previousDataLayout = dataLayout;
+                            currentDataPageId = new PageId(SYSTEM_TABLESPACE, nextPageId);
+                            bufferPool.unpinPage(previousDataPageId, false);
+                            
+                            // Add debugging
+                            logger.debug("Moving to next page {} in chain for table '{}'", nextPageId, tableName);
+                        } else {
+                            // This is the last page and it doesn't have enough space
+                            // We need to allocate a new page and link it
+                            logger.debug("Allocating new data page for table '{}' (current page {} is full)", 
+                                tableName, currentDataPageId);
+                            
+                            // Allocate a new page
+                            Page newDataPage = bufferPool.allocatePage();
+                            if (newDataPage == null) {
+                                logger.error("Failed to allocate new data page for table '{}'", tableName);
+                                bufferPool.unpinPage(currentDataPageId, false);
+                                return;
+                            }
+                            
+                            // Initialize the new page
+                            TableDataPageLayout newDataLayout = new TableDataPageLayout(newDataPage);
+                            newDataLayout.initialize();
+                            
+                            // Link the pages
+                            dataLayout.setNextPageId(newDataPage.getPageId().getPageNumber());
+                            dataPage.markDirty();
+                            
+                            // Try to add the row to the new page
+                            if (newDataLayout.addRow(rowData)) {
+                                inserted = true;
+                                newDataPage.markDirty();
+                                logger.debug("Inserted row into table '{}' on new page {}", 
+                                    tableName, newDataPage.getPageId());
+                            } else {
+                                logger.error("Failed to add row to new page {} - this should not happen", 
+                                    newDataPage.getPageId());
+                            }
+                            
+                            // Unpin both pages
+                            bufferPool.unpinPage(currentDataPageId, true);
+                            bufferPool.unpinPage(newDataPage.getPageId(), true);
+                        }
+                    }
+                    
+                    // If we've visited too many pages, break to avoid infinite loop
+                    if (!inserted && previousDataPageId != null && previousDataPageId.equals(currentDataPageId)) {
+                        logger.error("Circular reference detected in data pages for table '{}'", tableName);
+                        break;
+                    }
                 }
-                
-                // Store row from end of page backward
-                int newRowOffset = freeSpaceOffset - rowData.length;
-                int rowDirectoryPos = 16 + rowCount * 8;
-                
-                // Check if we have enough space
-                if (rowDirectoryPos + 8 >= newRowOffset) {
-                    logger.error("Cannot insert into table '{}': not enough space in data page", tableName);
-                    bufferPool.unpinPage(dataPageId, false);
-                    return;
-                }
-                
-                // Update directory
-                dataBuffer.position(rowDirectoryPos);
-                dataBuffer.putInt(newRowOffset);
-                dataBuffer.putInt(rowData.length);
-                
-                // Write row data
-                dataBuffer.position(newRowOffset);
-                dataBuffer.put(rowData);
-                
-                // Update metadata - row count and free space offset
-                dataBuffer.position(13);
-                dataBuffer.putInt(rowCount + 1);
-                dataBuffer.putInt(newRowOffset);
-                
-                // Mark page as dirty
-                dataPage.markDirty();
-                
-                // Force flush all pages to ensure they are written to disk
-                try {
-                    bufferPool.flushAll();
-                } catch (IOException e) {
-                    logger.error("Error flushing buffer pool after inserting into table '{}'", tableName, e);
-                }
-                
-                logger.debug("Inserted row into system table '{}'", tableName);
-            } finally {
-                // Unpin the data page
-                bufferPool.unpinPage(dataPageId, true);
+            } catch (IOException e) {
+                logger.error("Error accessing tablespace: {}", e.getMessage());
+            }
+            
+            // Flush all changes to disk
+            try {
+                bufferPool.flushAll();
+                logger.debug("Flushed all changes after inserting into table '{}'", tableName);
+            } catch (IOException e) {
+                logger.error("Error flushing buffer pool after inserting into table '{}'", tableName, e);
             }
         } catch (Exception e) {
-            logger.error("Failed to insert into system table '{}'", tableName, e);
+            logger.error("Failed to insert into table '{}'", tableName, e);
         }
     }
     
@@ -693,13 +851,17 @@ public class SchemaManager {
      */
     private void initializeTableHeaderPage(Page headerPage, Table table) throws IOException {
         // Create a table header page layout
-        PageLayout headerLayout = PageLayoutFactory.createNewPage(headerPage.getPageId(), headerPage.getPageSize(), PageType.TABLE_HEADER);
+        TableHeaderPageLayout headerLayout = new TableHeaderPageLayout(headerPage);
+        headerLayout.initialize();
         
-        // Write table metadata
+        // Set table name
+        headerLayout.setTableName(table.getName());
+        
+        // Set column count and information by writing directly to the buffer
         ByteBuffer buffer = headerPage.getBuffer();
         buffer.position(21); // Skip page layout header (HEADER_SIZE is protected)
         
-        // Write table name
+        // Write table name (already set by the layout method)
         buffer.putShort((short) table.getName().length());
         for (int i = 0; i < table.getName().length(); i++) {
             buffer.putChar(table.getName().charAt(i));
@@ -737,8 +899,8 @@ public class SchemaManager {
             buffer.put(table.getPrimaryKey().contains(column.getName()) ? (byte)1 : (byte)0);
         }
         
-        // Initialize the page layout
-        headerLayout.initialize();
+        // Mark the page as dirty
+        headerPage.markDirty();
     }
     
     /**
@@ -882,6 +1044,9 @@ public class SchemaManager {
         
         // Mark the page as dirty
         rootPage.markDirty();
+        
+        logger.debug("Initialized B-Tree root page for index '{}' with key type {}", 
+                index.getName(), firstColumn.getDataType());
     }
     
     /**

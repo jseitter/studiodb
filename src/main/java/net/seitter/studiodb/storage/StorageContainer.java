@@ -10,6 +10,8 @@ import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 
 import net.seitter.studiodb.schema.SchemaManager;
+import net.seitter.studiodb.storage.layout.ContainerMetadataPageLayout;
+import net.seitter.studiodb.storage.layout.FreeSpaceMapPageLayout;
 
 /**
  * Represents a physical storage container for a tablespace.
@@ -73,7 +75,7 @@ public class StorageContainer {
         // Page 1: Free space map
         // Page 2: First available page for user data
         if (isNewFile) {
-            // Allocate the minimum required space
+            // Allocate the minimum required space (3 pages)
             long initialMinBytes = 3L * pageSize;
             file.setLength(initialMinBytes);
             
@@ -122,32 +124,18 @@ public class StorageContainer {
     private void initializeContainerMetadataPage() throws IOException {
         PageId metadataPageId = new PageId(tablespaceName, 0);
         Page metadataPage = new Page(metadataPageId, pageSize);
-        ByteBuffer buffer = metadataPage.getBuffer();
         
-        // Write container metadata
-        // [Page Type (1 byte)] [Magic Number (4 bytes)] [Tablespace Name Length (2 bytes)] [Tablespace Name (variable)]
-        // [Page Size (4 bytes)] [Creation Time (8 bytes)] [Total Pages (4 bytes)]
+        // Use proper ContainerMetadataPageLayout instead of direct buffer access
+        ContainerMetadataPageLayout layout = new ContainerMetadataPageLayout(metadataPage);
+        layout.initialize();
         
-        // Write page type marker
-        buffer.put((byte) SchemaManager.PAGE_TYPE_CONTAINER_METADATA);
-        
-        // Write magic number for container metadata
-        buffer.putInt(SchemaManager.MAGIC_CONTAINER_METADATA);
-        
-        // Write tablespace name
-        buffer.putShort((short) tablespaceName.length());
-        for (int i = 0; i < tablespaceName.length(); i++) {
-            buffer.putChar(tablespaceName.charAt(i));
-        }
-        
-        // Write page size
-        buffer.putInt(pageSize);
-        
-        // Write creation time (current time in milliseconds)
-        buffer.putLong(System.currentTimeMillis());
-        
-        // Write total pages
-        buffer.putInt(getTotalPages());
+        // Set tablespace properties
+        layout.setTablespaceName(tablespaceName);
+        layout.setPageSize(pageSize);
+        layout.setCreationTime(System.currentTimeMillis());
+        layout.setLastOpenedTime(System.currentTimeMillis());
+        layout.setTotalPages(getTotalPages());
+        layout.setFreeSpaceMapPageId(1); // Page 1 is typically the free space map
         
         // Write the page to disk
         writePage(metadataPage);
@@ -162,42 +150,13 @@ public class StorageContainer {
     private void initializeFreeSpaceMapPage() throws IOException {
         PageId freeSpaceMapPageId = new PageId(tablespaceName, 1);
         Page freeSpaceMapPage = new Page(freeSpaceMapPageId, pageSize);
-        ByteBuffer buffer = freeSpaceMapPage.getBuffer();
         
-        // Basic format of a free space map page:
-        // [Page Type (1 byte)] [Magic Number (4 bytes)] [Last Page Checked (4 bytes)]
-        // [Bitmap Size (4 bytes)] [Bitmap (variable)]
+        // Use proper FreeSpaceMapPageLayout instead of direct buffer access
+        FreeSpaceMapPageLayout layout = new FreeSpaceMapPageLayout(freeSpaceMapPage);
+        layout.initialize();
         
-        // Write page type marker
-        buffer.put((byte) SchemaManager.PAGE_TYPE_FREE_SPACE_MAP);
-        
-        // Write magic number for free space map
-        // Since there's no specific magic number for free space map in SchemaManager, use the default
-        buffer.putInt(0xDADADADA);
-        
-        // Last page checked (starts at 1 which is the free space map page)
-        buffer.putInt(1);
-        
-        // Calculate how many pages can be tracked in this page
-        // Each bit represents one page, so we can track 8 pages per byte
-        int bitmapCapacity = (pageSize - 13) * 8; // 13 = header size
-        
-        // Write bitmap capacity
-        buffer.putInt(bitmapCapacity);
-        
-        // Initialize bitmap (all zeros means all pages are in use)
-        // We'll set bits specifically for free pages
-        for (int i = 0; i < (pageSize - 13); i++) {
-            buffer.put((byte) 0);
-        }
-        
-        // Explicitly mark page 2 as free (set bit 2 in the bitmap)
-        // The byte offset for page 2 is 2/8 = 0, and the bit offset is 2%8 = 2
-        buffer.position(13); // Position at the start of the bitmap
-        byte value = buffer.get(); // Get the first byte of the bitmap
-        value |= (1 << 2); // Set the bit at position 2 to 1 (1 means free)
-        buffer.position(13);
-        buffer.put(value);
+        // Mark page 2 as free (since pages 0 and 1 are used for metadata and free space map)
+        layout.markPageAsFree(2);
         
         // Write the page to disk
         writePage(freeSpaceMapPage);
@@ -225,32 +184,12 @@ public class StorageContainer {
             return;
         }
         
-        ByteBuffer buffer = freeSpaceMapPage.getBuffer();
+        // Use proper FreeSpaceMapPageLayout to manage the free space map
+        FreeSpaceMapPageLayout layout = new FreeSpaceMapPageLayout(freeSpaceMapPage);
         
-        // Skip header to get to bitmap
-        int bitmapOffset = 13; // 1 (type) + 4 (magic) + 4 (last checked) + 4 (capacity)
-        
-        // For each page in the range, set its bit in the bitmap
+        // Mark each page in the range as free
         for (int pageNum = startPage; pageNum <= endPage; pageNum++) {
-            int byteOffset = pageNum / 8;
-            int bitOffset = pageNum % 8;
-            
-            // Skip if beyond the bitmap capacity
-            if (byteOffset >= (pageSize - bitmapOffset)) {
-                logger.warn("Page {} is beyond the free space map capacity", pageNum);
-                break;
-            }
-            
-            // Read current byte
-            buffer.position(bitmapOffset + byteOffset);
-            byte currentByte = buffer.get();
-            
-            // Set the bit for this page (1 means free)
-            currentByte |= (1 << bitOffset);
-            
-            // Write back the updated byte
-            buffer.position(bitmapOffset + byteOffset);
-            buffer.put(currentByte);
+            layout.markPageAsFree(pageNum);
         }
         
         // Mark the page as dirty and write it back
@@ -277,28 +216,11 @@ public class StorageContainer {
             return;
         }
         
-        ByteBuffer buffer = freeSpaceMapPage.getBuffer();
+        // Use proper FreeSpaceMapPageLayout to manage the free space map
+        FreeSpaceMapPageLayout layout = new FreeSpaceMapPageLayout(freeSpaceMapPage);
         
-        // Skip header to get to bitmap
-        int bitmapOffset = 13; // 1 (type) + 4 (magic) + 4 (last checked) + 4 (capacity)
-        
-        int byteOffset = pageNum / 8;
-        int bitOffset = pageNum % 8;
-        
-        // Skip if beyond the bitmap capacity
-        if (byteOffset >= (pageSize - bitmapOffset)) {
-            logger.warn("Page {} is beyond the free space map capacity", pageNum);
-            return;
-        }
-        
-        // Read current byte
-        byte currentByte = buffer.get(bitmapOffset + byteOffset);
-        
-        // Clear the bit for this page (0 means used)
-        currentByte &= ~(1 << bitOffset);
-        
-        // Write back the updated byte
-        buffer.put(bitmapOffset + byteOffset, currentByte);
+        // Mark the page as used
+        layout.markPageAsUsed(pageNum);
         
         // Mark the page as dirty and write it back
         freeSpaceMapPage.markDirty();
@@ -318,79 +240,21 @@ public class StorageContainer {
             return -1;
         }
         
-        ByteBuffer buffer = freeSpaceMapPage.getBuffer();
+        // Use proper FreeSpaceMapPageLayout to find a free page
+        FreeSpaceMapPageLayout layout = new FreeSpaceMapPageLayout(freeSpaceMapPage);
         
-        // Skip header to get to bitmap
-        int bitmapOffset = 13; // 1 (type) + 4 (magic) + 4 (last checked) + 4 (capacity)
+        // Find the next free page using the layout's method
+        int freePage = layout.findNextFreePage();
         
-        // Read last checked page to start search from there
-        buffer.position(5); // Skip page type and magic number
-        int lastChecked = buffer.getInt();
-        int bitmapCapacity = buffer.getInt();
-        logger.debug("Last checked page: {}, Bitmap capacity: {}", lastChecked, bitmapCapacity);
-        // Start search from the last checked page + 1
-        int startPage = lastChecked + 1;
-        logger.debug("Start page: {}", startPage);
-        if (startPage < 2) startPage = 2; // Pages 0 and 1 are never free
+        // No need to update the page - the layout's method already did that
         
-        // First pass: search from lastChecked to end
-        for (int pageNum = startPage; pageNum < bitmapCapacity; pageNum++) {
-            int byteOffset = pageNum / 8;
-            int bitOffset = pageNum % 8;
-            
-            // Skip if beyond the bitmap capacity
-            if (byteOffset >= (pageSize - bitmapOffset)) {
-                break;
-            }
-            
-            // Read current byte
-            buffer.position(bitmapOffset + byteOffset);
-            byte currentByte = buffer.get();
-            
-            // Check if the bit for this page is set (1 means free)
-            if ((currentByte & (1 << bitOffset)) != 0) {
-                // Update last checked page
-                buffer.position(5);
-                buffer.putInt(pageNum);
-                
-                // Mark page as dirty and write it back
-                freeSpaceMapPage.markDirty();
-                writePage(freeSpaceMapPage);
-                
-                return pageNum;
-            }
+        if (freePage >= 0) {
+            logger.debug("Found free page {} in tablespace '{}'", freePage, tablespaceName);
+        } else {
+            logger.debug("No free pages found in tablespace '{}'", tablespaceName);
         }
         
-        // Second pass: search from beginning to lastChecked
-        for (int pageNum = 2; pageNum <= lastChecked; pageNum++) {
-            int byteOffset = pageNum / 8;
-            int bitOffset = pageNum % 8;
-            
-            // Skip if beyond the bitmap capacity
-            if (byteOffset >= (pageSize - bitmapOffset)) {
-                break;
-            }
-            
-            // Read current byte
-            buffer.position(bitmapOffset + byteOffset);
-            byte currentByte = buffer.get();
-            
-            // Check if the bit for this page is set (1 means free)
-            if ((currentByte & (1 << bitOffset)) != 0) {
-                // Update last checked page
-                buffer.position(5);
-                buffer.putInt(pageNum);
-                
-                // Mark page as dirty and write it back
-                freeSpaceMapPage.markDirty();
-                writePage(freeSpaceMapPage);
-                
-                return pageNum;
-            }
-        }
-        
-        // No free pages found
-        return -1;
+        return freePage;
     }
     
     /**
@@ -556,18 +420,14 @@ public class StorageContainer {
         Page metadataPage = readPage(0);
         
         if (metadataPage != null) {
-            ByteBuffer buffer = metadataPage.getBuffer();
-            
-            // Navigate to the total pages field, which is near the end of the metadata
-            // Skip: page type (1), magic (4), name length (2), name (variable), page size (4), creation time (8)
-            int tableNameLength = buffer.getShort(5) & 0xFFFF;
-            int totalPagesOffset = 7 + (tableNameLength * 2) + 4 + 8;
+            // Use proper ContainerMetadataPageLayout to update metadata
+            ContainerMetadataPageLayout layout = new ContainerMetadataPageLayout(metadataPage);
             
             // Update total pages
-            buffer.position(totalPagesOffset);
-            buffer.putInt(getTotalPages());
+            layout.setTotalPages(getTotalPages());
+            layout.setLastOpenedTime(System.currentTimeMillis());
             
-            // Write the updated page
+            // Mark as dirty and write back
             metadataPage.markDirty();
             writePage(metadataPage);
         }

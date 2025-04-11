@@ -10,6 +10,7 @@
 7. [Buffer Pool Management](#buffer-pool-management)
 8. [Row Storage Format](#row-storage-format)
 9. [Free Space Management](#free-space-management)
+10. [Diagnostic Commands](#diagnostic-commands)
 
 ## Introduction
 
@@ -62,24 +63,28 @@ Each page in StudioDB has the following general structure:
 +------------------+
 ```
 
-### Page Header (21 bytes)
+### Page Header (32 bytes)
 - **Page Type** (1 byte): Identifies the type of page (Table Data, Index, etc.)
 - **Magic Number** (4 bytes): A constant value (0xDADADADA) to verify page integrity
 - **Next Page ID** (4 bytes): Page number of the next page in a chain, or -1
 - **Previous Page ID** (4 bytes): Page number of the previous page in a chain, or -1
-- **Row Count** (4 bytes): Number of rows/entries in the page
 - **Free Space Offset** (4 bytes): Offset to the start of free space
+- **Reserved** (15 bytes): Reserved for future use, ensuring the header is 32 bytes total
+
+Each page type may use the page header fields slightly differently and extend with additional metadata after the header.
 
 ## Page Layout Hierarchy
 
 The page layout system is organized as a class hierarchy:
 
 ```
-              PageLayout (abstract)
-                   |
-       +-----------+------------+
-       |           |            |
-TableHeaderLayout TableDataLayout IndexPageLayout
+                      PageLayout (abstract)
+                            |
+       +----------+----------+----------+----------+
+       |          |          |          |          |
+TableHeader  TableData   IndexPage  Container  FreeSpaceMap
+  Layout      Layout      Layout    Metadata    PageLayout
+                                    PageLayout
 ```
 
 ### PageLayout (Abstract Base Class)
@@ -101,6 +106,16 @@ TableHeaderLayout TableDataLayout IndexPageLayout
 - Implements B-tree index nodes
 - Variants for leaf and internal nodes
 - Stores keys and references
+
+### ContainerMetadataPageLayout
+- Stores metadata about the tablespace container
+- Contains tablespace name, page size, and creation timestamp
+- Keeps track of total pages and free space map location
+
+### FreeSpaceMapPageLayout
+- Implements bitmap-based free space tracking
+- Manages page allocation and deallocation
+- Provides methods to find free pages efficiently
 
 ## Page Types
 
@@ -134,20 +149,22 @@ A tablespace container is a physical file on disk that stores pages. The file ha
 ```
 
 ### Container Metadata Page (Page 0)
-- **Page Type** (1 byte): Set to CONTAINER_METADATA
-- **Magic Number** (4 bytes): 0xDADADADA
-- **Tablespace Name Length** (2 bytes): Length of the tablespace name
-- **Tablespace Name** (variable): The name of the tablespace
+- **Common Page Header**: Including type (CONTAINER_METADATA) and magic number
 - **Page Size** (4 bytes): Size of pages in the container
 - **Creation Time** (8 bytes): Timestamp when the container was created
+- **Last Opened Time** (8 bytes): Timestamp when the container was last opened
 - **Total Pages** (4 bytes): Total number of pages in the container
+- **Free Space Map Page ID** (4 bytes): Page ID of the free space map (typically 1)
+- **Tablespace Name Length** (2 bytes): Length of the tablespace name
+- **Tablespace Name** (variable): The name of the tablespace (as UTF-16 characters)
 
 ### Free Space Map Page (Page 1)
-- **Page Type** (1 byte): Set to FREE_SPACE_MAP
-- **Magic Number** (4 bytes): 0xDADADADA
-- **Last Page Checked** (4 bytes): Last page number checked for allocation
-- **Bitmap Size** (4 bytes): Size of the bitmap in bytes
+- **Common Page Header**: Including type (FREE_SPACE_MAP) and magic number
+- **Last Checked Page** (4 bytes): Last page number checked for allocation
+- **Bitmap Capacity** (4 bytes): Number of pages that can be tracked by this bitmap
 - **Bitmap** (variable): A bitmap where each bit represents a page (1 = free, 0 = used)
+
+The free space map uses a bitmap to track page allocation status. Each bit represents one page, with a set bit (1) indicating the page is free and a cleared bit (0) indicating the page is in use. The bitmap is sized to accommodate the maximum number of pages that can fit in the tablespace container.
 
 ## Buffer Pool Management
 
@@ -174,6 +191,8 @@ Table data pages use a slotted page structure:
 ```
 +----------------------+
 | Page Header          |
++----------------------+
+| Row Count            | (4 bytes)
 +----------------------+
 | Row Directory        | (grows downward)
 | (offset, length)     |
@@ -211,4 +230,28 @@ Free space is managed at two levels:
 - A bitmap represents all pages in the tablespace (1 bit per page)
 - When a page is allocated, its bit is set to 0 (used)
 - When a page is deallocated, its bit is set to 1 (free)
-- The allocation algorithm scans the bitmap to find free pages 
+- The allocation algorithm scans the bitmap to find free pages
+- The LastCheckedPage field is used to implement a round-robin allocation policy
+
+## Diagnostic Commands
+
+StudioDB provides several diagnostic commands to inspect the storage layer:
+
+### SHOW PAGES Command
+
+The `SHOW PAGES IN TABLESPACE tablespace_name` command displays detailed information about all pages in a tablespace. For each page, it shows:
+
+- **PAGE_ID**: The page number
+- **TYPE**: The page type (TABLE_HEADER, TABLE_DATA, etc.)
+- **NEXT_PAGE**: The next page in the chain (-1 if none)
+- **PREV_PAGE**: The previous page in the chain (-1 if none)
+- **FREE_SPACE**: Free space available in the page
+- **ADDITIONAL_INFO**: Page-specific information
+
+The additional information varies by page type:
+
+- **ContainerMetadataPageLayout**: Shows tablespace name, page size, total pages, free space map page ID, and creation date
+- **FreeSpaceMapPageLayout**: Shows capacity (total pages tracked), number of free pages, percentage available, and last checked page
+- **TableHeaderPageLayout**: Shows table name and first data page ID
+- **TableDataPageLayout**: Shows record count, free space, and sample of row sizes
+- **IndexPageLayout**: Shows whether the page is a leaf or internal node, key count, and key type 
