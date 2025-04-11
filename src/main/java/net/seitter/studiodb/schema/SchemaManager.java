@@ -1,7 +1,6 @@
 package net.seitter.studiodb.schema;
 
 import net.seitter.studiodb.DatabaseSystem;
-import net.seitter.studiodb.buffer.BufferPoolManager;
 import net.seitter.studiodb.buffer.IBufferPoolManager;
 import net.seitter.studiodb.storage.Page;
 import net.seitter.studiodb.storage.PageId;
@@ -47,23 +46,6 @@ public class SchemaManager {
     public static final int CATALOG_TYPE_COLUMNS = 3;
     public static final int CATALOG_TYPE_INDEXES = 4;
     public static final int CATALOG_TYPE_INDEX_COLUMNS = 5;
-    
-    // Page type magic numbers - these are kept for backward compatibility
-    public static final int PAGE_TYPE_UNUSED = 0;
-    public static final int PAGE_TYPE_TABLE_HEADER = 1;
-    public static final int PAGE_TYPE_TABLE_DATA = 2;
-    public static final int PAGE_TYPE_INDEX_HEADER = 3;
-    public static final int PAGE_TYPE_INDEX_INTERNAL = 4;
-    public static final int PAGE_TYPE_INDEX_LEAF = 5;
-    public static final int PAGE_TYPE_FREE_SPACE_MAP = 7;
-    public static final int PAGE_TYPE_TRANSACTION_LOG = 8;
-    public static final int PAGE_TYPE_CONTAINER_METADATA = 9;
-    
-    // Page header magic numbers - these are kept for backward compatibility
-    public static final int MAGIC_TABLE_HEADER = 0xDADA0101;
-    public static final int MAGIC_TABLE_DATA = 0xDADA0201;
-    public static final int MAGIC_BTREE_PAGE = 0xDADA0301;
-    public static final int MAGIC_CONTAINER_METADATA = 0xDADA0001;
     
     /**
      * Creates a new schema manager.

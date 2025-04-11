@@ -1,7 +1,6 @@
 package net.seitter.studiodb.storage.layout;
 
 import net.seitter.studiodb.schema.DataType;
-import net.seitter.studiodb.schema.SchemaManager;
 import net.seitter.studiodb.storage.Page;
 import net.seitter.studiodb.storage.PageId;
 import net.seitter.studiodb.storage.PageLayout;
@@ -13,8 +12,6 @@ import java.nio.ByteBuffer;
  * Determines the appropriate layout class based on the page type.
  */
 public class PageLayoutFactory {
-    // Define header size constant locally to avoid access issues with protected field in PageLayout
-    private static final int PAGE_HEADER_SIZE = 21; // Same as PageLayout.HEADER_SIZE
     
     /**
      * Creates a page layout for the given page.
@@ -25,7 +22,7 @@ public class PageLayoutFactory {
     public static PageLayout createLayout(Page page) {
         ByteBuffer buffer = page.getBuffer();
         
-        if (buffer.limit() < PAGE_HEADER_SIZE) {
+        if (buffer.limit() < PageLayout.HEADER_SIZE) {
             return null;
         }
         
