@@ -949,10 +949,8 @@ public class SchemaManager {
             logger.debug("Attempting to insert row of {} bytes into table '{}'", rowData.length, tableName);
             
             // Try to insert into the first data page or chain of data pages
-            boolean inserted = false;
-            PageId currentDataPageId = new PageId(SYSTEM_TABLESPACE, firstDataPageId);
-            PageId previousDataPageId = null;
-            TableDataPageLayout previousDataLayout = null;
+            final boolean[] insertedFlag = new boolean[1]; // Using array to make it effectively final
+            int currentPageId = firstDataPageId;
             
             // Add extra debugging
             logger.info("Attempting to insert into first data page {} for table '{}'", firstDataPageId, tableName);
@@ -961,10 +959,14 @@ public class SchemaManager {
                 Tablespace tablespace = dbSystem.getStorageManager().getTablespace(SYSTEM_TABLESPACE);
                 int totalPages = tablespace.getTotalPages();
                 
+                // Track visited page IDs to detect circular references
+                List<Integer> visitedPageIds = new ArrayList<>();
+                final int MAX_PAGE_VISITS = 100; // Define a reasonable limit
+                
                 // Try to find a page with enough space for the row
-                while (!inserted) {
+                while (!insertedFlag[0]) {
                     // Verify page ID is valid before fetching
-                    int pageNumber = currentDataPageId.getPageNumber();
+                    int pageNumber = currentPageId;
                     if (pageNumber < 0 || pageNumber >= totalPages) {
                         logger.error("Invalid page number {} (valid range: 0-{}), allocating new page", 
                             pageNumber, totalPages - 1);
@@ -981,13 +983,14 @@ public class SchemaManager {
                         newDataLayout.initialize();
                         
                         // If we have a previous page, link it to this new one
-                        if (previousDataPageId != null) {
-                            Page prevPage = bufferPool.fetchPage(previousDataPageId);
+                        if (currentPageId != -1) {
+                            PageId prevPageId = new PageId(SYSTEM_TABLESPACE, currentPageId);
+                            Page prevPage = bufferPool.fetchPage(prevPageId);
                             if (prevPage != null) {
                                 TableDataPageLayout prevLayout = new TableDataPageLayout(prevPage);
                                 prevLayout.setNextPageId(newDataPage.getPageId().getPageNumber());
                                 prevPage.markDirty();
-                                bufferPool.unpinPage(previousDataPageId, true);
+                                bufferPool.unpinPage(prevPageId, true);
                             }
                         } else {
                             // This is the first data page, update the table header
@@ -1006,7 +1009,7 @@ public class SchemaManager {
                         
                         // Try to add the row to the new page
                         if (newDataLayout.addRow(rowData)) {
-                            inserted = true;
+                            insertedFlag[0] = true;
                             newDataPage.markDirty();
                             logger.info("Inserted row into table '{}' on new page {}", 
                                 tableName, newDataPage.getPageId());
@@ -1017,12 +1020,24 @@ public class SchemaManager {
                         
                         // Unpin the new page
                         bufferPool.unpinPage(newDataPage.getPageId(), true);
+                        
+                        // Track visited page IDs to detect circular references
+                        visitedPageIds.add(currentPageId);
+                        
+                        // If we've visited too many pages, break to avoid infinite loop
+                        if (!insertedFlag[0] && currentPageId != -1 && visitedPageIds.size() > MAX_PAGE_VISITS) {
+                            logger.error("Possible circular reference detected in data pages for table '{}' after visiting {} pages", 
+                                tableName, visitedPageIds.size());
+                            break;
+                        }
+                        
                         break;
                     }
                     
-                    Page dataPage = bufferPool.fetchPage(currentDataPageId);
+                    PageId dataPageId = new PageId(SYSTEM_TABLESPACE, currentPageId);
+                    Page dataPage = bufferPool.fetchPage(dataPageId);
                     if (dataPage == null) {
-                        logger.error("Cannot insert into table '{}': data page {} not found", tableName, currentDataPageId);
+                        logger.error("Cannot insert into table '{}': data page {} not found", tableName, currentPageId);
                         return;
                     }
                     
@@ -1032,14 +1047,14 @@ public class SchemaManager {
                     if (dataLayout.getFreeSpace() >= rowData.length + TableDataPageLayout.ROW_DIRECTORY_ENTRY_SIZE) {
                         // Add the row to this page
                         if (dataLayout.addRow(rowData)) {
-                            inserted = true;
+                            insertedFlag[0] = true;
                             dataPage.markDirty();
-                            bufferPool.unpinPage(currentDataPageId, true);
-                            logger.debug("Inserted row into table '{}' on page {}", tableName, currentDataPageId);
+                            bufferPool.unpinPage(dataPageId, true);
+                            logger.debug("Inserted row into table '{}' on page {}", tableName, currentPageId);
                         } else {
                             // If addRow returns false despite our space check, something went wrong
-                            logger.error("Failed to add row to page {} despite space check", currentDataPageId);
-                            bufferPool.unpinPage(currentDataPageId, false);
+                            logger.error("Failed to add row to page {} despite space check", currentPageId);
+                            bufferPool.unpinPage(dataPageId, false);
                         }
                     } else {
                         // Not enough space - check for next page
@@ -1047,24 +1062,18 @@ public class SchemaManager {
                         
                         if (nextPageId != -1) {
                             // Move to the next page in the chain
-                            previousDataPageId = currentDataPageId;
-                            previousDataLayout = dataLayout;
-                            currentDataPageId = new PageId(SYSTEM_TABLESPACE, nextPageId);
-                            bufferPool.unpinPage(previousDataPageId, false);
-                            
-                            // Add debugging
-                            logger.debug("Moving to next page {} in chain for table '{}'", nextPageId, tableName);
+                            currentPageId = nextPageId;
                         } else {
                             // This is the last page and it doesn't have enough space
                             // We need to allocate a new page and link it
                             logger.debug("Allocating new data page for table '{}' (current page {} is full)", 
-                                tableName, currentDataPageId);
+                                tableName, currentPageId);
                             
                             // Allocate a new page
                             Page newDataPage = bufferPool.allocatePage();
                             if (newDataPage == null) {
                                 logger.error("Failed to allocate new data page for table '{}'", tableName);
-                                bufferPool.unpinPage(currentDataPageId, false);
+                                bufferPool.unpinPage(dataPageId, false);
                                 return;
                             }
                             
@@ -1078,7 +1087,7 @@ public class SchemaManager {
                             
                             // Try to add the row to the new page
                             if (newDataLayout.addRow(rowData)) {
-                                inserted = true;
+                                insertedFlag[0] = true;
                                 newDataPage.markDirty();
                                 logger.debug("Inserted row into table '{}' on new page {}", 
                                     tableName, newDataPage.getPageId());
@@ -1088,14 +1097,17 @@ public class SchemaManager {
                             }
                             
                             // Unpin both pages
-                            bufferPool.unpinPage(currentDataPageId, true);
-                            bufferPool.unpinPage(newDataPage.getPageId(), true);
+                            bufferPool.unpinPage(dataPageId, true);
                         }
                     }
                     
+                    // Track visited page IDs to detect circular references
+                    visitedPageIds.add(currentPageId);
+                    
                     // If we've visited too many pages, break to avoid infinite loop
-                    if (!inserted && previousDataPageId != null && previousDataPageId.equals(currentDataPageId)) {
-                        logger.error("Circular reference detected in data pages for table '{}'", tableName);
+                    if (!insertedFlag[0] && currentPageId != -1 && visitedPageIds.size() > MAX_PAGE_VISITS) {
+                        logger.error("Possible circular reference detected in data pages for table '{}' after visiting {} pages", 
+                            tableName, visitedPageIds.size());
                         break;
                     }
                 }
@@ -1623,127 +1635,189 @@ public class SchemaManager {
                 return false;
             }
             
-            // Get the header page
-            int headerPageNumber = table.getHeaderPageId();
-            PageId headerPageId = new PageId(table.getTablespaceName(), headerPageNumber);
-            
-            // Fetch the header page
-            Page headerPage = bufferPool.fetchPage(headerPageId);
-            if (headerPage == null) {
-                logger.error("Cannot insert into table '{}': header page not found", tableName);
-                return false;
-            }
-            
-            // Get the table header layout
-            TableHeaderPageLayout headerLayout = new TableHeaderPageLayout(headerPage);
-            
-            // Get the first data page ID
-            int firstDataPageId = headerLayout.getFirstDataPageId();
-            if (firstDataPageId == -1) {
-                // Allocate a new data page if none exists
-                Page newDataPage = bufferPool.allocatePage();
-                if (newDataPage == null) {
-                    logger.error("Failed to allocate new data page for table '{}'", tableName);
-                    bufferPool.unpinPage(headerPageId, false);
-                    return false;
-                }
-                
-                // Initialize the data page
-                TableDataPageLayout newDataLayout = new TableDataPageLayout(newDataPage);
-                newDataLayout.initialize();
-                
-                // Update the header with this new page ID
-                firstDataPageId = newDataPage.getPageId().getPageNumber();
-                headerLayout.setFirstDataPageId(firstDataPageId);
-                headerPage.markDirty();
-                
-                // Also update the table object
-                table.setFirstDataPageId(firstDataPageId);
-                
-                // Unpin the new page for now
-                bufferPool.unpinPage(newDataPage.getPageId(), true);
-                logger.debug("Allocated first data page {} for table '{}'", firstDataPageId, tableName);
-            }
-            
-            // Unpin the header page as we no longer need it
-            bufferPool.unpinPage(headerPageId, headerPage.isDirty());
-            
             // Serialize the row
-            byte[] rowData = serializeRow(row);
+            final byte[] rowData = serializeRow(row);
             
-            // Try to insert into the chain of data pages
-            boolean inserted = false;
-            PageId currentDataPageId = new PageId(table.getTablespaceName(), firstDataPageId);
-            
-            while (!inserted) {
-                Page dataPage = bufferPool.fetchPage(currentDataPageId);
-                if (dataPage == null) {
-                    logger.error("Data page {} for table '{}' not found", currentDataPageId, tableName);
-                    return false;
-                }
-                
-                TableDataPageLayout dataLayout = new TableDataPageLayout(dataPage);
-                
-                // Check if there's enough space in this page
-                if (dataLayout.getFreeSpace() >= rowData.length + TableDataPageLayout.ROW_DIRECTORY_ENTRY_SIZE) {
-                    // Add the row to this page
-                    if (dataLayout.addRow(rowData)) {
-                        inserted = true;
-                        dataPage.markDirty();
-                        logger.debug("Inserted row into table '{}' on page {}", tableName, currentDataPageId);
-                    } else {
-                        logger.error("Failed to add row to page {} despite space check", currentDataPageId);
+            // Import the utility class
+            net.seitter.studiodb.buffer.BufferPoolUtils.SafePageOperationChain<Boolean> insertOperation = 
+                (bp) -> {
+                    // First get the header page to find the first data page
+                    PageId headerPageId = new PageId(table.getTablespaceName(), table.getHeaderPageId());
+                    
+                    // Use withPage for header page operations
+                    Integer firstDataPageId = net.seitter.studiodb.buffer.BufferPoolUtils.withPage(
+                        bp, headerPageId, false, headerPage -> {
+                            if (headerPage == null) {
+                                logger.error("Header page for table '{}' not found", tableName);
+                                return null;
+                            }
+                            
+                            TableHeaderPageLayout headerLayout = new TableHeaderPageLayout(headerPage);
+                            int dataPageId = headerLayout.getFirstDataPageId();
+                            
+                            // If no first data page, allocate one
+                            if (dataPageId == -1) {
+                                Page newDataPage = null;
+                                try {
+                                    newDataPage = bp.allocatePage();
+                                    if (newDataPage == null) {
+                                        logger.error("Failed to allocate data page for table '{}'", tableName);
+                                        return null;
+                                    }
+                                    
+                                    TableDataPageLayout dataLayout = new TableDataPageLayout(newDataPage);
+                                    dataLayout.initialize();
+                                    
+                                    dataPageId = newDataPage.getPageId().getPageNumber();
+                                    headerLayout.setFirstDataPageId(dataPageId);
+                                    headerPage.markDirty();
+                                    
+                                    // Also update the table object
+                                    table.setFirstDataPageId(dataPageId);
+                                    
+                                    logger.debug("Allocated first data page {} for table '{}'", 
+                                            dataPageId, tableName);
+                                } finally {
+                                    // Ensure the new page is properly unpinned
+                                    if (newDataPage != null) {
+                                        bp.unpinPage(newDataPage.getPageId(), true);
+                                    }
+                                }
+                            }
+                            
+                            return dataPageId;
+                        });
+                    
+                    if (firstDataPageId == null) {
+                        return false;
                     }
                     
-                    bufferPool.unpinPage(currentDataPageId, dataPage.isDirty());
-                } else {
-                    // Not enough space - check for next page
-                    int nextPageId = dataLayout.getNextPageId();
+                    // Try to insert into the chain of data pages
+                    final boolean[] insertedFlag = new boolean[1]; // Using array to make it effectively final
+                    int currentPageId = firstDataPageId;
                     
-                    if (nextPageId != -1) {
-                        // Move to the next page in the chain
-                        bufferPool.unpinPage(currentDataPageId, false);
-                        currentDataPageId = new PageId(table.getTablespaceName(), nextPageId);
-                    } else {
-                        // This is the last page and it doesn't have enough space
-                        // We need to allocate a new page and link it
-                        Page newDataPage = bufferPool.allocatePage();
-                        if (newDataPage == null) {
-                            logger.error("Failed to allocate new data page for table '{}'", tableName);
-                            bufferPool.unpinPage(currentDataPageId, false);
-                            return false;
-                        }
+                    // Track visited page IDs to detect circular references
+                    List<Integer> visitedPageIds = new ArrayList<>();
+                    final int MAX_PAGE_VISITS = 100; // Define a reasonable limit
+                    
+                    while (!insertedFlag[0]) {
+                        final int pageToRead = currentPageId;
+                        Integer nextPageId = net.seitter.studiodb.buffer.BufferPoolUtils.withPage(
+                            bp, new PageId(table.getTablespaceName(), pageToRead), false, dataPage -> {
+                                
+                                if (dataPage == null) {
+                                    logger.error("Data page {} for table '{}' not found", pageToRead, tableName);
+                                    return null;
+                                }
+                                
+                                TableDataPageLayout dataLayout = new TableDataPageLayout(dataPage);
+                                
+                                // Check if there's enough space in this page
+                                if (dataLayout.getFreeSpace() >= rowData.length + TableDataPageLayout.ROW_DIRECTORY_ENTRY_SIZE) {
+                                    // Add the row to this page
+                                    if (dataLayout.addRow(rowData)) {
+                                        dataPage.markDirty();
+                                        logger.debug("Inserted row into table '{}' on page {}", 
+                                                tableName, pageToRead);
+                                        // Return special -2 value to indicate row was inserted
+                                        return -2;
+                                    } else {
+                                        logger.error("Failed to add row to page {} despite space check", pageToRead);
+                                        return null;
+                                    }
+                                }
+                                
+                                // Not enough space - return the next page ID
+                                return dataLayout.getNextPageId();
+                            });
                         
-                        // Initialize the new page
-                        TableDataPageLayout newDataLayout = new TableDataPageLayout(newDataPage);
-                        newDataLayout.initialize();
-                        
-                        // Link the pages
-                        dataLayout.setNextPageId(newDataPage.getPageId().getPageNumber());
-                        dataPage.markDirty();
-                        bufferPool.unpinPage(currentDataPageId, true);
-                        
-                        // Try to add the row to the new page
-                        if (newDataLayout.addRow(rowData)) {
-                            inserted = true;
-                            newDataPage.markDirty();
-                            logger.debug("Inserted row into table '{}' on new page {}", 
-                                tableName, newDataPage.getPageId());
+                        if (nextPageId == null) {
+                            return false; // Error occurred
+                        } else if (nextPageId == -2) {
+                            insertedFlag[0] = true; // Row was inserted
+                            break;
+                        } else if (nextPageId != -1) {
+                            // Move to the next page in the chain
+                            currentPageId = nextPageId;
                         } else {
-                            logger.error("Failed to add row to new page {} - this should not happen", newDataPage.getPageId());
+                            // This is the last page and it doesn't have enough space
+                            // We need to allocate a new page and link it
+                            final int lastPageId = currentPageId;
+                            Boolean allocateSuccess = net.seitter.studiodb.buffer.BufferPoolUtils.withPage(
+                                bp, new PageId(table.getTablespaceName(), lastPageId), true, lastPage -> {
+                                    
+                                    if (lastPage == null) {
+                                        logger.error("Last data page {} for table '{}' not found", 
+                                                lastPageId, tableName);
+                                        return false;
+                                    }
+                                    
+                                    TableDataPageLayout lastPageLayout = new TableDataPageLayout(lastPage);
+                                    
+                                    // Allocate a new page
+                                    Page newDataPage = null;
+                                    try {
+                                        newDataPage = bp.allocatePage();
+                                        if (newDataPage == null) {
+                                            logger.error("Failed to allocate new data page for table '{}'", 
+                                                    tableName);
+                                            return false;
+                                        }
+                                        
+                                        // Initialize the new page
+                                        TableDataPageLayout newDataLayout = new TableDataPageLayout(newDataPage);
+                                        newDataLayout.initialize();
+                                        
+                                        // Link the pages
+                                        lastPageLayout.setNextPageId(newDataPage.getPageId().getPageNumber());
+                                        
+                                        // Try to add the row to the new page
+                                        if (newDataLayout.addRow(rowData)) {
+                                            newDataPage.markDirty();
+                                            logger.debug("Inserted row into table '{}' on new page {}", 
+                                                    tableName, newDataPage.getPageId());
+                                            insertedFlag[0] = true;
+                                            return true;
+                                        } else {
+                                            logger.error("Failed to add row to new page {} - this should not happen", 
+                                                    newDataPage.getPageId());
+                                            return false;
+                                        }
+                                    } finally {
+                                        // Ensure the new page is properly unpinned
+                                        if (newDataPage != null) {
+                                            bp.unpinPage(newDataPage.getPageId(), true);
+                                        }
+                                    }
+                                });
+                            
+                            if (allocateSuccess == null || !allocateSuccess) {
+                                return false;
+                            }
+                            
+                            break; // Exit the loop since we've either inserted or failed
                         }
                         
-                        bufferPool.unpinPage(newDataPage.getPageId(), true);
+                        // Track visited page IDs to detect circular references
+                        visitedPageIds.add(currentPageId);
+                        
+                        // If we've visited too many pages, break to avoid infinite loop
+                        if (!insertedFlag[0] && currentPageId != -1 && visitedPageIds.size() > MAX_PAGE_VISITS) {
+                            logger.error("Possible circular reference detected in data pages for table '{}' after visiting {} pages", 
+                                tableName, visitedPageIds.size());
+                            break;
+                        }
                     }
-                }
-            }
+                    
+                    // Update indexes if insertion was successful
+                    if (insertedFlag[0]) {
+                        updateIndexesForInsertedRow(table, row);
+                    }
+                    
+                    return insertedFlag[0];
+                };
             
-            // Update indexes if insertion was successful
-            if (inserted) {
-                updateIndexesForInsertedRow(table, row);
-            }
-            
-            return inserted;
+            return net.seitter.studiodb.buffer.BufferPoolUtils.withSafeOperations(bufferPool, insertOperation);
         } catch (Exception e) {
             logger.error("Failed to insert row into table '{}'", tableName, e);
             return false;

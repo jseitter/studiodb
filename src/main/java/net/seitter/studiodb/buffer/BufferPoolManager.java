@@ -83,6 +83,9 @@ public class BufferPoolManager implements IBufferPoolManager {
             // Pin the page
             page.pin();
             
+            // Record pin operation for debugging
+            PinTracker.recordPin(pageId);
+            
             // Update hit statistic
             pageHits.incrementAndGet();
             
@@ -111,6 +114,9 @@ public class BufferPoolManager implements IBufferPoolManager {
         
         // Pin the page
         page.pin();
+        
+        // Record pin operation for debugging
+        PinTracker.recordPin(pageId);
         
         // Update miss statistic
         pageMisses.incrementAndGet();
@@ -142,6 +148,9 @@ public class BufferPoolManager implements IBufferPoolManager {
         }
         
         boolean unpinned = page.unpin();
+        
+        // Record unpin operation for debugging
+        PinTracker.recordUnpin(pageId);
         
         if (!unpinned) {
             logger.warn("Attempted to unpin page {} with pin count already at 0", pageId);

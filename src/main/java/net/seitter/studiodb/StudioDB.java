@@ -250,6 +250,7 @@ public class StudioDB {
         
         // System Catalog
         terminal.writer().println("\n-- System Catalog --");
+        terminal.writer().println("SELECT * FROM SYS_TABLESPACES; View all tablespaces in the system catalog");
         terminal.writer().println("SELECT * FROM SYS_TABLES;      View all tables in the system catalog");
         terminal.writer().println("SELECT * FROM SYS_COLUMNS;     View all columns in the system catalog");
         terminal.writer().println("SELECT * FROM SYS_INDEXES;     View all indexes in the system catalog");
@@ -260,7 +261,7 @@ public class StudioDB {
         terminal.writer().println("SHOW BUFFERPOOLS;              Display buffer pool usage information");
         terminal.writer().println("SHOW STATISTICS;               Show detailed page allocation and buffer pool stats");
         terminal.writer().println("SHOW PAGES IN TABLESPACE name; Display detailed page layout for a specific tablespace");
-        
+        terminal.writer().println("SHOW PINCOUNT;                 Show pin count for each page in the buffer pool");
         // Data Types
         terminal.writer().println("\n-- Supported Data Types --");
         terminal.writer().println("INTEGER                        32-bit integer");
