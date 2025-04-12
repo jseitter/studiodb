@@ -904,119 +904,124 @@ public class SQLEngine {
         
         StringBuilder sb = new StringBuilder();
         sb.append("PAGE LAYOUT FOR TABLESPACE: ").append(tablespaceName).append("\n\n");
-        sb.append(String.format("%-10s %-20s %-15s %-15s %-15s %-20s\n", 
+        sb.append(String.format("%-10s %-20s %-15s %-15s %-15s %-40s\n", 
                 "PAGE_ID", "TYPE", "NEXT_PAGE", "PREV_PAGE", "FREE_SPACE", "ADDITIONAL_INFO"));
-        sb.append(String.format("%-10s %-20s %-15s %-15s %-15s %-20s\n", 
-                "----------", "--------------------", "---------------", "---------------", "---------------", "--------------------"));
+        sb.append(String.format("%-10s %-20s %-15s %-15s %-15s %-40s\n", 
+                "----------", "--------------------", "---------------", "---------------", "---------------", "----------------------------------------"));
         
+        // Get the total pages in the tablespace
+        int totalPages = 0;
         try {
-            // Get total pages in tablespace
-            int totalPages = tablespace.getTotalPages();
+            totalPages = tablespace.getTotalPages();
+        } catch (IOException e) {
+            logger.error("Failed to get total pages", e);
+            return "Failed to get total pages in tablespace: " + e.getMessage();
+        }
+        
+        // Get the buffer pool manager for this tablespace
+        IBufferPoolManager bpm = dbSystem.getBufferPoolManager(tablespaceName);
+        
+        // Iterate through all pages
+        for (int pageNum = 0; pageNum < totalPages; pageNum++) {
+            PageId pageId = new PageId(tablespaceName, pageNum);
+            Page page = null;
+            boolean pinned = false;
             
-            // Get buffer pool manager for this tablespace to check if page is in memory
-            BufferPoolManager bpm = null;
-            Map<String, BufferPoolManager> bufferPools = new HashMap<>();
             try {
-                java.lang.reflect.Field bpmsField = DatabaseSystem.class.getDeclaredField("bufferPoolManagers");
-                bpmsField.setAccessible(true);
-                bufferPools = (Map<String, BufferPoolManager>) bpmsField.get(dbSystem);
-                bpm = bufferPools.get(tablespaceName);
-            } catch (Exception e) {
-                logger.warn("Failed to get buffer pool manager", e);
-            }
-            
-            // Iterate through all pages
-            for (int pageNum = 0; pageNum < totalPages; pageNum++) {
-                PageId pageId = new PageId(tablespaceName, pageNum);
+                if (bpm != null) {
+                    page = bpm.fetchPage(pageId);
+                    pinned = true;
+                } else {
+                    // Direct fetch from disk if no buffer pool
+                    page = tablespace.readPage(pageNum);
+                }
                 
-                // Try to fetch the page
-                Page page = null;
-                boolean pinned = false;
-                
-                try {
-                    if (bpm != null) {
-                        page = bpm.fetchPage(pageId);
-                        pinned = true;
-                    } else {
-                        // Direct fetch from disk if no buffer pool
-                        page = tablespace.readPage(pageNum);
-                    }
+                if (page != null) {
+                    // Use PageLayoutFactory to get the appropriate layout for this page
+                    PageLayout layout = null;
                     
-                    if (page != null) {
-                        // Use PageLayoutFactory to get the appropriate layout for this page
-                        PageLayout layout = null;
+                    try {
+                        layout = PageLayoutFactory.createLayout(page);
                         
-                        try {
-                            layout = PageLayoutFactory.createLayout(page);
-                            
-                            if (layout != null) {
+                        if (layout != null) {
+                            try {
+                                // Get page information from the layout
+                                int nextPageId = layout.getNextPageId();
+                                int prevPageId = layout.getPrevPageId();
+                                int freeSpace = layout.getFreeSpace();
+                                PageType pageType = layout.getPageType();
+                                
+                                String additionalInfo = ""; 
                                 try {
-                                    // Get page information from the layout
-                                    int nextPageId = layout.getNextPageId();
-                                    int prevPageId = layout.getPrevPageId();
-                                    int freeSpace = layout.getFreeSpace();
-                                    PageType pageType = layout.getPageType();
-                                    
-                                    String additionalInfo = ""; 
-                                    try {
-                                        additionalInfo = getAdditionalPageInfoFromLayout(layout);
-                                    } catch (Exception e) {
-                                        logger.error("Error getting additional info for page " + pageNum, e);
-                                        additionalInfo = "Error: " + e.getClass().getSimpleName() + 
-                                            (e.getMessage() != null ? ": " + e.getMessage() : "");
-                                    }
-                                    
-                                    sb.append(String.format("%-10d %-20s %-15d %-15d %-15d %-20s\n", 
-                                            pageNum, pageType.toString(), nextPageId, prevPageId, freeSpace, additionalInfo));
+                                    additionalInfo = getAdditionalPageInfoFromLayout(layout);
                                 } catch (Exception e) {
-                                    logger.error("Error reading layout values for page " + pageNum, e);
-                                    sb.append(String.format("%-10d %-20s %-15s %-15s %-15s %-20s\n", 
-                                            pageNum, "LAYOUT_ERROR", "N/A", "N/A", "N/A", 
-                                            "Error: " + e.getClass().getSimpleName() + 
-                                            (e.getMessage() != null ? ": " + e.getMessage() : "")));
-                                }
-                            } else {
-                                // Try to check just the page type byte
-                                int typeId = page.getBuffer().get(0) & 0xFF;
-                                String typeInfo = "Unknown type: " + typeId;
-                                try {
-                                    PageType type = PageType.fromTypeId(typeId);
-                                    typeInfo = "Type: " + type + ", invalid header";
-                                } catch (Exception e) {
-                                    // Ignore
+                                    logger.error("Error getting additional info for page " + pageNum, e);
+                                    additionalInfo = "Error: " + e.getClass().getSimpleName() + 
+                                        (e.getMessage() != null ? ": " + e.getMessage() : "");
                                 }
                                 
-                                // If no layout could be created, the page is likely uninitialized or corrupt
-                                sb.append(String.format("%-10d %-20s %-15s %-15s %-15s %-20s\n", 
-                                        pageNum, "UNKNOWN/CORRUPT", "N/A", "N/A", "N/A", typeInfo));
+                                sb.append(String.format("%-10d %-20s %-15d %-15d %-15d %-40.40s\n", 
+                                        pageNum, pageType.toString(), nextPageId, prevPageId, freeSpace, additionalInfo));
+                                
+                                // For longer additional info, add extra lines
+                                if (additionalInfo.length() > 40) {
+                                    for (int i = 40; i < additionalInfo.length(); i += 80) {
+                                        String continuation = "  " + additionalInfo.substring(i, Math.min(i + 80, additionalInfo.length()));
+                                        sb.append(String.format("%-10s %-20s %-15s %-15s %-15s %-40s\n", 
+                                            "", "", "", "", "", continuation));
+                                    }
+                                }
+                            } catch (Exception e) {
+                                logger.error("Error reading layout values for page " + pageNum, e);
+                                sb.append(String.format("%-10d %-20s %-15s %-15s %-15s %-40s\n", 
+                                        pageNum, "LAYOUT_ERROR", "N/A", "N/A", "N/A", 
+                                        "Error: " + e.getClass().getSimpleName() + 
+                                        (e.getMessage() != null ? ": " + e.getMessage() : "")));
                             }
-                        } catch (Exception e) {
-                            logger.error("Error creating layout for page " + pageNum, e);
-                            sb.append(String.format("%-10d %-20s %-15s %-15s %-15s %-20s\n", 
-                                    pageNum, "CREATE_LAYOUT_ERROR", "N/A", "N/A", "N/A", 
-                                    "Error: " + e.getClass().getSimpleName() + 
-                                    (e.getMessage() != null ? ": " + e.getMessage() : "")));
+                        } else {
+                            // Try to check just the page type byte and magic number
+                            ByteBuffer buffer = page.getBuffer();
+                            int typeId = buffer.get(0) & 0xFF;
+                            int magic = buffer.getInt(1) & 0xFFFFFFFF;
+                            
+                            String typeInfo = String.format("Unknown typeId: %d, Magic: 0x%08X", 
+                                    typeId, magic);
+                            
+                            try {
+                                PageType type = PageType.fromTypeId(typeId);
+                                typeInfo = String.format("Type: %s, Magic: 0x%08X (expected: 0x%08X)", 
+                                        type, magic, PageLayout.MAGIC_NUMBER);
+                            } catch (Exception e) {
+                                // Ignore
+                            }
+                            
+                            // If no layout could be created, the page is likely uninitialized or corrupt
+                            sb.append(String.format("%-10d %-20s %-15s %-15s %-15s %-40s\n", 
+                                    pageNum, "UNKNOWN/CORRUPT", "N/A", "N/A", "N/A", typeInfo));
                         }
-                    } else {
-                        sb.append(String.format("%-10d %-20s %-15s %-15s %-15s %-20s\n", 
-                                pageNum, "UNALLOCATED", "N/A", "N/A", "N/A", ""));
+                    } catch (Exception e) {
+                        logger.error("Error creating layout for page " + pageNum, e);
+                        sb.append(String.format("%-10d %-20s %-15s %-15s %-15s %-40s\n", 
+                                pageNum, "CREATE_LAYOUT_ERROR", "N/A", "N/A", "N/A", 
+                                "Error: " + e.getClass().getSimpleName() + 
+                                (e.getMessage() != null ? ": " + e.getMessage() : "")));
                     }
-                } catch (Exception e) {
-                    logger.error("Error processing page " + pageNum, e);
-                    sb.append(String.format("%-10d %-20s %-15s %-15s %-15s %-20s\n", 
-                            pageNum, "PAGE_ACCESS_ERROR", "N/A", "N/A", "N/A", 
-                            "Error: " + e.getClass().getSimpleName() + 
-                            (e.getMessage() != null ? ": " + e.getMessage() : "")));
-                } finally {
-                    // Unpin the page if it was pinned
-                    if (pinned && page != null) {
-                        bpm.unpinPage(pageId, false);
-                    }
+                } else {
+                    sb.append(String.format("%-10d %-20s %-15s %-15s %-15s %-40s\n", 
+                            pageNum, "UNALLOCATED", "N/A", "N/A", "N/A", ""));
+                }
+            } catch (Exception e) {
+                logger.error("Error processing page " + pageNum, e);
+                sb.append(String.format("%-10d %-20s %-15s %-15s %-15s %-40s\n", 
+                        pageNum, "PAGE_ACCESS_ERROR", "N/A", "N/A", "N/A", 
+                        "Error: " + e.getClass().getSimpleName() + 
+                        (e.getMessage() != null ? ": " + e.getMessage() : "")));
+            } finally {
+                // Unpin the page if it was pinned
+                if (pinned && page != null) {
+                    bpm.unpinPage(pageId, false);
                 }
             }
-        } catch (IOException e) {
-            logger.error("Error reading pages from tablespace", e);
-            return "Failed to read pages from tablespace: " + e.getMessage();
         }
         
         return sb.toString();
@@ -1033,15 +1038,27 @@ public class SQLEngine {
         
         if (layout instanceof TableHeaderPageLayout) {
             TableHeaderPageLayout headerLayout = (TableHeaderPageLayout) layout;
+            int firstDataPageId = headerLayout.getFirstDataPageId();
             info.append("Table: ").append(headerLayout.getTableName())
-                .append(", FirstDataPage: ").append(headerLayout.getFirstDataPageId());
+                .append(", FirstDataPage: ").append(firstDataPageId);
+                
+            // Add column count info
+            try {
+                int colCount = headerLayout.getColumnCount();
+                info.append(", Columns: ").append(colCount);
+            } catch (Exception e) {
+                info.append(", Columns: Error");
+            }
         }
         else if (layout instanceof TableDataPageLayout) {
             TableDataPageLayout dataLayout = (TableDataPageLayout) layout;
             // Use proper API method to get row count
             int rowCount = dataLayout.getRowCount();
+            int freeSpace = dataLayout.getFreeSpace();
+            
             info.append("Records: ").append(rowCount)
-                .append(", FreeSpace: ").append(dataLayout.getFreeSpace()).append(" bytes");
+                .append(", FreeSpace: ").append(freeSpace).append(" bytes")
+                .append(", Buffer: ").append(dataLayout.getPage().getBuffer().capacity()).append(" bytes");
             
             // Show some row information if rows exist
             if (rowCount > 0) {
