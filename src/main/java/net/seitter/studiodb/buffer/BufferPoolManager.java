@@ -27,6 +27,13 @@ public class BufferPoolManager implements IBufferPoolManager {
     private final Queue<PageId> replacementQueue;
     private final AtomicInteger dirtyPageCount;
     private final PageCleaner pageCleaner;
+    
+    // Statistics counters
+    private final AtomicInteger pageHits = new AtomicInteger(0);
+    private final AtomicInteger pageMisses = new AtomicInteger(0);
+    private final AtomicInteger pageEvictions = new AtomicInteger(0);
+    private final AtomicInteger pageAllocations = new AtomicInteger(0);
+    private final AtomicInteger pageFlushes = new AtomicInteger(0);
 
     /**
      * Creates a new buffer pool manager.
@@ -76,6 +83,9 @@ public class BufferPoolManager implements IBufferPoolManager {
             // Pin the page
             page.pin();
             
+            // Update hit statistic
+            pageHits.incrementAndGet();
+            
             logger.debug("Page {} hit in buffer pool", pageId);
             return page;
         }
@@ -85,6 +95,8 @@ public class BufferPoolManager implements IBufferPoolManager {
         
         if (page == null) {
             logger.warn("Page {} does not exist on disk", pageId);
+            // Count as miss
+            pageMisses.incrementAndGet();
             return null;
         }
 
@@ -99,6 +111,9 @@ public class BufferPoolManager implements IBufferPoolManager {
         
         // Pin the page
         page.pin();
+        
+        // Update miss statistic
+        pageMisses.incrementAndGet();
         
         logger.debug("Page {} loaded from disk to buffer pool", pageId);
         return page;
@@ -152,6 +167,7 @@ public class BufferPoolManager implements IBufferPoolManager {
             storageManager.writePage(page);
             page.markClean();
             dirtyPageCount.decrementAndGet();
+            pageFlushes.incrementAndGet();
             logger.debug("Flushed dirty page {} to disk", pageId);
             return true;
         }
@@ -185,6 +201,9 @@ public class BufferPoolManager implements IBufferPoolManager {
         
         // Pin the page
         page.pin();
+        
+        // Update allocations statistic
+        pageAllocations.incrementAndGet();
         
         logger.debug("Allocated new page {} and added to buffer pool", pageId);
         return page;
@@ -223,10 +242,14 @@ public class BufferPoolManager implements IBufferPoolManager {
         if (victimPage.isDirty()) {
             storageManager.writePage(victimPage);
             dirtyPageCount.decrementAndGet();
+            pageFlushes.incrementAndGet();
             logger.debug("Evicted dirty page {} and flushed to disk", victimPageId);
         } else {
             logger.debug("Evicted clean page {}", victimPageId);
         }
+        
+        // Update eviction statistic
+        pageEvictions.incrementAndGet();
     }
 
     /**
@@ -307,5 +330,68 @@ public class BufferPoolManager implements IBufferPoolManager {
         } catch (IOException e) {
             logger.error("Error shutting down buffer pool for tablespace '{}'", tablespaceName, e);
         }
+    }
+
+    /**
+     * Gets statistics about the buffer pool.
+     * 
+     * @return A map of statistic names to values
+     */
+    @Override
+    public Map<String, Object> getStatistics() {
+        Map<String, Object> stats = new HashMap<>();
+        
+        // Basic stats
+        stats.put("tablespaceName", tablespaceName);
+        stats.put("capacity", capacity);
+        stats.put("size", getSize());
+        stats.put("usagePercentage", (double) getSize() / capacity * 100.0);
+        stats.put("dirtyPages", dirtyPageCount.get());
+        
+        // Performance stats
+        stats.put("pageHits", pageHits.get());
+        stats.put("pageMisses", pageMisses.get());
+        int totalAccesses = pageHits.get() + pageMisses.get();
+        double hitRatio = totalAccesses > 0 ? (double) pageHits.get() / totalAccesses * 100.0 : 0.0;
+        stats.put("hitRatio", hitRatio);
+        stats.put("pageEvictions", pageEvictions.get());
+        stats.put("pageAllocations", pageAllocations.get());
+        stats.put("pageFlushes", pageFlushes.get());
+        
+        // Page cleaner stats if available
+        if (pageCleaner != null) {
+            stats.put("cleanerEnabled", pageCleaner.isRunning());
+            stats.put("cleanerInterval", pageCleaner.getConfig().getCheckIntervalMs());
+            stats.put("dirtyPageThreshold", pageCleaner.getConfig().getDirtyPageThreshold());
+            stats.put("lastCleanTime", pageCleaner.getLastCleanTime());
+            stats.put("totalCleanings", pageCleaner.getTotalCleanings());
+        }
+        
+        return stats;
+    }
+    
+    /**
+     * Gets details about pages currently in the buffer pool.
+     * 
+     * @return A map of page IDs to page details
+     */
+    @Override
+    public synchronized Map<PageId, Map<String, Object>> getPageDetails() {
+        Map<PageId, Map<String, Object>> details = new HashMap<>();
+        
+        for (Map.Entry<PageId, Page> entry : pageTable.entrySet()) {
+            PageId pageId = entry.getKey();
+            Page page = entry.getValue();
+            
+            Map<String, Object> pageDetails = new HashMap<>();
+            pageDetails.put("pageNumber", pageId.getPageNumber());
+            pageDetails.put("pinCount", page.getPinCount());
+            pageDetails.put("isDirty", page.isDirty());
+            pageDetails.put("size", page.getPageSize());
+            
+            details.put(pageId, pageDetails);
+        }
+        
+        return details;
     }
 } 

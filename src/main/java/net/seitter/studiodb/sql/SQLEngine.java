@@ -1240,100 +1240,108 @@ public class SQLEngine {
     private String executeShowStatistics() {
         StringBuilder sb = new StringBuilder();
         
-        // Get buffer pools through reflection
-        Map<String, BufferPoolManager> bufferPools = new HashMap<>();
-        try {
-            java.lang.reflect.Field bpmsField = DatabaseSystem.class.getDeclaredField("bufferPoolManagers");
-            bpmsField.setAccessible(true);
-            bufferPools = (Map<String, BufferPoolManager>) bpmsField.get(dbSystem);
-        } catch (Exception e) {
-            logger.error("Failed to get buffer pool managers", e);
-            return "Failed to retrieve buffer pool information: " + e.getMessage();
+        // Get all buffer pool managers
+        List<String> tablespacesNames = dbSystem.getStorageManager().getAllTablespaceNames();
+        if (tablespacesNames.isEmpty()) {
+            return "No tablespaces found.";
         }
         
-        if (bufferPools.isEmpty()) {
-            return "No buffer pools found.";
-        }
-        
-        // Display detailed buffer pool statistics
+        // Display detailed buffer pool statistics for each tablespace
         sb.append("BUFFER POOL STATISTICS:\n\n");
         
-        for (BufferPoolManager bpm : bufferPools.values()) {
-            String tablespaceName = bpm.getTablespaceName();
-            sb.append("Tablespace: ").append(tablespaceName).append("\n");
-            sb.append(String.format("  Capacity: %d pages\n", bpm.getCapacity()));
-            sb.append(String.format("  Current Size: %d pages\n", bpm.getSize()));
-            sb.append(String.format("  Usage: %.2f%%\n", (double) bpm.getSize() / bpm.getCapacity() * 100.0));
+        for (String tablespaceName : tablespacesNames) {
+            IBufferPoolManager bpm = dbSystem.getBufferPoolManager(tablespaceName);
+            if (bpm == null) {
+                continue;
+            }
             
-            // Get and display detailed page information using reflection
-            Map<PageId, Page> pageTable = new HashMap<>();
-            try {
-                java.lang.reflect.Field pageTableField = BufferPoolManager.class.getDeclaredField("pageTable");
-                pageTableField.setAccessible(true);
-                pageTable = (Map<PageId, Page>) pageTableField.get(bpm);
+            // Get statistics using the new API
+            Map<String, Object> stats = bpm.getStatistics();
+            
+            sb.append("Tablespace: ").append(tablespaceName).append("\n");
+            sb.append(String.format("  Capacity: %d pages\n", stats.get("capacity")));
+            sb.append(String.format("  Current Size: %d pages\n", stats.get("size")));
+            sb.append(String.format("  Usage: %.2f%%\n", stats.get("usagePercentage")));
+            sb.append(String.format("  Dirty Pages: %d\n", stats.get("dirtyPages")));
+            
+            // Performance statistics
+            sb.append("\n  PERFORMANCE METRICS:\n");
+            sb.append(String.format("  Page Hits: %d\n", stats.get("pageHits")));
+            sb.append(String.format("  Page Misses: %d\n", stats.get("pageMisses")));
+            sb.append(String.format("  Hit Ratio: %.2f%%\n", stats.get("hitRatio")));
+            sb.append(String.format("  Page Evictions: %d\n", stats.get("pageEvictions")));
+            sb.append(String.format("  Page Allocations: %d\n", stats.get("pageAllocations")));
+            sb.append(String.format("  Page Flushes: %d\n", stats.get("pageFlushes")));
+            
+            // Page Cleaner statistics if available
+            if (stats.containsKey("cleanerEnabled")) {
+                sb.append("\n  PAGE CLEANER:\n");
+                sb.append(String.format("  Enabled: %s\n", stats.get("cleanerEnabled")));
+                sb.append(String.format("  Check Interval: %d ms\n", stats.get("cleanerInterval")));
+                sb.append(String.format("  Dirty Page Threshold: %d\n", stats.get("dirtyPageThreshold")));
                 
-                if (!pageTable.isEmpty()) {
-                    sb.append("\n  LOADED PAGES:\n");
-                    sb.append(String.format("  %-10s %-10s %-10s %-10s\n", 
-                            "PAGE_NO", "PIN COUNT", "DIRTY", "SIZE (B)"));
-                    sb.append(String.format("  %-10s %-10s %-10s %-10s\n", 
-                            "----------", "----------", "----------", "----------"));
+                long lastCleanTime = (long) stats.get("lastCleanTime");
+                String lastCleanTimeStr = lastCleanTime > 0 ? 
+                    new java.util.Date(lastCleanTime).toString() : "Never";
+                sb.append(String.format("  Last Clean Time: %s\n", lastCleanTimeStr));
+                sb.append(String.format("  Total Cleanings: %d\n", stats.get("totalCleanings")));
+            }
+            
+            // Get page details using the new API
+            Map<PageId, Map<String, Object>> pageDetails = bpm.getPageDetails();
+            
+            if (!pageDetails.isEmpty()) {
+                sb.append("\n  LOADED PAGES:\n");
+                sb.append(String.format("  %-10s %-10s %-10s %-10s\n", 
+                        "PAGE_NO", "PIN COUNT", "DIRTY", "SIZE (B)"));
+                sb.append(String.format("  %-10s %-10s %-10s %-10s\n", 
+                        "----------", "----------", "----------", "----------"));
+                
+                for (Map.Entry<PageId, Map<String, Object>> entry : pageDetails.entrySet()) {
+                    PageId pageId = entry.getKey();
+                    Map<String, Object> details = entry.getValue();
                     
-                    for (Map.Entry<PageId, Page> entry : pageTable.entrySet()) {
-                        PageId pageId = entry.getKey();
-                        Page page = entry.getValue();
-                        
-                        sb.append(String.format("  %-10d %-10d %-10s %-10d\n", 
-                                pageId.getPageNumber(), 
-                                page.getPinCount(), 
-                                page.isDirty() ? "YES" : "NO", 
-                                page.getPageSize()));
-                    }
-                } else {
-                    sb.append("\n  No pages currently loaded.\n");
+                    sb.append(String.format("  %-10d %-10d %-10s %-10d\n", 
+                            details.get("pageNumber"), 
+                            details.get("pinCount"), 
+                            (Boolean)details.get("isDirty") ? "YES" : "NO", 
+                            details.get("size")));
                 }
-            } catch (Exception e) {
-                logger.error("Failed to get page table", e);
-                sb.append("\n  Failed to retrieve page information: ").append(e.getMessage()).append("\n");
+            } else {
+                sb.append("\n  No pages currently loaded.\n");
             }
             
             sb.append("\n");
         }
         
-        // Get storage manager and tablespaces
+        // Storage statistics section
+        sb.append("STORAGE STATISTICS:\n\n");
+        
         StorageManager storageManager = dbSystem.getStorageManager();
-        Map<String, Tablespace> tablespaces = new HashMap<>();
-        try {
-            java.lang.reflect.Field tablespacesField = StorageManager.class.getDeclaredField("tablespaces");
-            tablespacesField.setAccessible(true);
-            tablespaces = (Map<String, Tablespace>) tablespacesField.get(storageManager);
-            
-            sb.append("STORAGE STATISTICS:\n\n");
-            
-            for (Tablespace tablespace : tablespaces.values()) {
-                String name = tablespace.getName();
-                int pageSize = tablespace.getPageSize();
-                int totalPages;
-                
-                try {
-                    totalPages = tablespace.getTotalPages();
-                    long totalSizeBytes = (long) totalPages * pageSize;
-                    double totalSizeMB = totalSizeBytes / (1024.0 * 1024.0);
-                    
-                    sb.append("Tablespace: ").append(name).append("\n");
-                    sb.append(String.format("  Container: %s\n", tablespace.getStorageContainer().getContainerPath()));
-                    sb.append(String.format("  Page Size: %d bytes\n", pageSize));
-                    sb.append(String.format("  Total Pages: %d\n", totalPages));
-                    sb.append(String.format("  Total Size: %.2f MB\n", totalSizeMB));
-                    sb.append("\n");
-                } catch (IOException e) {
-                    sb.append("Tablespace: ").append(name).append("\n");
-                    sb.append("  Error reading tablespace statistics: ").append(e.getMessage()).append("\n\n");
-                }
+        for (String tablespaceName : tablespacesNames) {
+            Tablespace tablespace = storageManager.getTablespace(tablespaceName);
+            if (tablespace == null) {
+                continue;
             }
-        } catch (Exception e) {
-            logger.error("Failed to get tablespaces", e);
-            sb.append("Failed to retrieve tablespace information: ").append(e.getMessage()).append("\n");
+            
+            int pageSize = tablespace.getPageSize();
+            int totalPages;
+            
+            try {
+                totalPages = tablespace.getTotalPages();
+                long totalSizeBytes = (long) totalPages * pageSize;
+                double totalSizeMB = totalSizeBytes / (1024.0 * 1024.0);
+                
+                sb.append("Tablespace: ").append(tablespaceName).append("\n");
+                sb.append(String.format("  Container: %s\n", tablespace.getStorageContainer().getContainerPath()));
+                sb.append(String.format("  Page Size: %d bytes\n", pageSize));
+                sb.append(String.format("  Total Pages: %d\n", totalPages));
+                sb.append(String.format("  Total Size: %.2f MB\n", totalSizeMB));
+                sb.append("\n");
+            } catch (IOException e) {
+                sb.append("Tablespace: ").append(tablespaceName).append("\n");
+                sb.append("  Error reading tablespace statistics: ").append(e.getMessage()).append("\n\n");
+            }
         }
         
         return sb.toString();
