@@ -17,9 +17,13 @@ import org.slf4j.LoggerFactory;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Arrays;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
 
 /**
  * Manages database objects like tables and indexes, and their schema information.
@@ -152,7 +156,7 @@ public class SchemaManager {
                 columnColumns.add(new Column("COLUMN_POSITION", DataType.INTEGER, false));
                 columnColumns.add(new Column("DATA_TYPE", DataType.INTEGER, false));
                 columnColumns.add(new Column("NULLABLE", DataType.BOOLEAN, false));
-                columnColumns.add(new Column("MAX_LENGTH", DataType.INTEGER, true));
+                columnColumns.add(new Column("MAX_LENGTH", DataType.INTEGER, false));
                 columnColumns.add(new Column("IS_PRIMARY_KEY", DataType.BOOLEAN, false));
                 
                 List<String> columnPK = new ArrayList<>();
@@ -238,49 +242,58 @@ public class SchemaManager {
      */
     private Table createSystemTable(String tableName, List<Column> columns, List<String> primaryKeyColumns) {
         try {
-            // Create the table object
+            // Get the buffer pool for the system tablespace
+            IBufferPoolManager bufferPool = dbSystem.getBufferPoolManager(SYSTEM_TABLESPACE);
+            if (bufferPool == null) {
+                logger.error("Failed to get buffer pool for system tablespace");
+                return null;
+            }
+            
+            // Create a new table
             Table table = new Table(tableName, SYSTEM_TABLESPACE);
-            table.addColumns(columns);
+            
+            // Add columns to the table
+            for (Column column : columns) {
+                table.addColumn(column);
+            }
+            
+            // Set primary key
             if (primaryKeyColumns != null && !primaryKeyColumns.isEmpty()) {
                 table.setPrimaryKey(primaryKeyColumns);
             }
             
-            // Allocate header page
-            IBufferPoolManager bufferPool = dbSystem.getBufferPoolManager(SYSTEM_TABLESPACE);
-            if (bufferPool == null) {
-                logger.error("System tablespace does not exist");
-                return null;
-            }
-            
+            // Allocate a header page
             Page headerPage = bufferPool.allocatePage();
             if (headerPage == null) {
-                logger.error("Failed to allocate header page for system table '{}'", tableName);
+                logger.error("Failed to allocate header page for table '{}'", tableName);
                 return null;
             }
             
-            table.setHeaderPageId(headerPage.getPageId().getPageNumber());
-            
-            // Initialize header page with table info
-            initializeTableHeaderPage(headerPage, table);
-            
-            // Allocate first data page
+            // Allocate a data page
             Page firstDataPage = bufferPool.allocatePage();
             if (firstDataPage == null) {
-                logger.error("Failed to allocate first data page for system table '{}'", tableName);
-                bufferPool.unpinPage(headerPage.getPageId(), true); // Make sure to unpin the header page
+                logger.error("Failed to allocate first data page for table '{}'", tableName);
+                // Unpin the header page we already allocated
+                bufferPool.unpinPage(headerPage.getPageId(), false);
                 return null;
             }
+            
+            // Initialize the header page
+            int headerPageNumber = headerPage.getPageId().getPageNumber();
+            table.setHeaderPageId(headerPageNumber);
+            
+            initializeTableHeaderPage(headerPage, table);
             
             // Initialize the data page
             initializeTableDataPage(firstDataPage);
             
-            // Update the header page with the first data page ID
+            // Link header page to data page
             updateHeaderPageWithFirstDataPageId(headerPage.getPageId(), firstDataPage.getPageId().getPageNumber(), bufferPool);
             
-            // Store data page ID in the table object for redundancy
             table.setFirstDataPageId(firstDataPage.getPageId().getPageNumber());
             
-            // Unpin the data page, marking it as dirty to flush changes
+            // Unpin the header page and data page, marking them as dirty to ensure changes are persisted
+            bufferPool.unpinPage(headerPage.getPageId(), true);
             bufferPool.unpinPage(firstDataPage.getPageId(), true);
             
             // Store the table in our schema
@@ -293,6 +306,241 @@ public class SchemaManager {
                 logger.debug("Flushed all changes after creating system table '{}'", tableName);
             } catch (IOException e) {
                 logger.warn("Failed to flush buffer pool after creating system table '{}': {}", tableName, e.getMessage());
+            }
+            
+            // Now, if this is not the SYS_TABLES table itself, we need to persist this table in SYS_TABLES
+            if (!tableName.equals(SYS_TABLES) && tableExists(SYS_TABLES)) {
+                try {
+                    // Create a row to represent this table in the SYS_TABLES table
+                    Map<String, Object> row = new HashMap<>();
+                    row.put("TABLE_NAME", tableName);
+                    row.put("TABLESPACE_NAME", SYSTEM_TABLESPACE);
+                    row.put("HEADER_PAGE_ID", headerPageNumber);
+                    row.put("FIRST_DATA_PAGE_ID", firstDataPage.getPageId().getPageNumber());
+                    
+                    // Insert the row into SYS_TABLES
+                    insertIntoSystemTable(SYS_TABLES, row);
+                    logger.debug("Persisted table '{}' info to SYS_TABLES", tableName);
+                } catch (Exception e) {
+                    logger.warn("Failed to persist table '{}' info to SYS_TABLES: {}", tableName, e.getMessage());
+                    // Continue anyway, as the table is still created
+                }
+            }
+            // If this is the SYS_TABLES table itself, we need to insert a row for itself once it's created
+            else if (tableName.equals(SYS_TABLES)) {
+                try {
+                    // First, get the TableDataPageLayout for the data page to directly insert the row
+                    TableDataPageLayout dataLayout = new TableDataPageLayout(firstDataPage);
+                    
+                    // Create a row to represent SYS_TABLES in itself
+                    Map<String, Object> sysTablesRow = new HashMap<>();
+                    sysTablesRow.put("TABLE_NAME", SYS_TABLES);
+                    sysTablesRow.put("TABLESPACE_NAME", SYSTEM_TABLESPACE);
+                    sysTablesRow.put("HEADER_PAGE_ID", headerPageNumber);
+                    sysTablesRow.put("FIRST_DATA_PAGE_ID", firstDataPage.getPageId().getPageNumber());
+                    
+                    // Serialize the row using Jackson
+                    byte[] rowData = null;
+                    try {
+                        ObjectMapper mapper = new ObjectMapper();
+                        rowData = mapper.writeValueAsBytes(sysTablesRow);
+                    } catch (Exception e) {
+                        logger.error("Failed to serialize row for SYS_TABLES self-entry", e);
+                    }
+                    
+                    if (rowData != null) {
+                        // Add the row directly to the data page
+                        boolean added = dataLayout.addRow(rowData);
+                        if (added) {
+                            logger.debug("Added self-reference row to SYS_TABLES");
+                            // Make sure to mark the page as dirty
+                            firstDataPage.markDirty();
+                        } else {
+                            logger.warn("Failed to add self-reference row to SYS_TABLES");
+                        }
+                    }
+                } catch (Exception e) {
+                    logger.warn("Failed to add self-reference row to SYS_TABLES: {}", e.getMessage());
+                }
+            }
+            
+            // Now we need to persist column information if SYS_COLUMNS exists
+            if (tableExists(SYS_COLUMNS)) {
+                try {
+                    // First persist the columns of the table to SYS_COLUMNS
+                    for (int i = 0; i < columns.size(); i++) {
+                        Column column = columns.get(i);
+                        
+                        Map<String, Object> colRow = new HashMap<>();
+                        colRow.put("TABLE_NAME", tableName);
+                        colRow.put("COLUMN_NAME", column.getName());
+                        colRow.put("COLUMN_POSITION", i);
+                        colRow.put("DATA_TYPE", column.getDataType().ordinal());
+                        colRow.put("NULLABLE", column.isNullable());
+                        colRow.put("MAX_LENGTH", column.getMaxLength());
+                        
+                        // Check if column is part of primary key
+                        boolean isPk = primaryKeyColumns != null && primaryKeyColumns.contains(column.getName());
+                        colRow.put("IS_PRIMARY_KEY", isPk);
+                        
+                        insertIntoSystemTable(SYS_COLUMNS, colRow);
+                        logger.debug("Persisted column '{}' of table '{}' to SYS_COLUMNS", column.getName(), tableName);
+                    }
+                } catch (Exception e) {
+                    logger.warn("Failed to persist columns for table '{}' to SYS_COLUMNS: {}", tableName, e.getMessage());
+                    // Continue anyway, as the table and basic structure are still created
+                }
+            }
+            // If this is SYS_COLUMNS itself, add column info directly
+            else if (tableName.equals(SYS_COLUMNS)) {
+                try {
+                    logger.info("Attempting to initialize SYS_COLUMNS with self-referential data");
+                    
+                    // Get the data page layout
+                    TableDataPageLayout dataLayout = new TableDataPageLayout(firstDataPage);
+                    
+                    // Add each column of SYS_COLUMNS to itself
+                    for (int i = 0; i < columns.size(); i++) {
+                        Column column = columns.get(i);
+                        
+                        Map<String, Object> colRow = new HashMap<>();
+                        colRow.put("TABLE_NAME", SYS_COLUMNS);
+                        colRow.put("COLUMN_NAME", column.getName());
+                        colRow.put("COLUMN_POSITION", i);
+                        // Store the ordinal value instead of the string name
+                        colRow.put("DATA_TYPE", column.getDataType().ordinal());
+                        colRow.put("NULLABLE", column.isNullable());
+                        colRow.put("MAX_LENGTH", column.getMaxLength());
+                        
+                        // Check if column is part of primary key
+                        boolean isPk = primaryKeyColumns != null && primaryKeyColumns.contains(column.getName());
+                        colRow.put("IS_PRIMARY_KEY", isPk);
+                        
+                        logger.info("Creating row for SYS_COLUMNS self-reference: column={}, position={}", column.getName(), i);
+                        
+                        // Serialize directly
+                        ObjectMapper mapper = new ObjectMapper();
+                        byte[] rowData = mapper.writeValueAsBytes(colRow);
+                        
+                        boolean added = dataLayout.addRow(rowData);
+                        if (added) {
+                            logger.info("Successfully added column '{}' info directly to SYS_COLUMNS", column.getName());
+                            firstDataPage.markDirty();
+                        } else {
+                            logger.warn("Failed to add column '{}' info to SYS_COLUMNS", column.getName());
+                        }
+                    }
+                    
+                    // Final flush to ensure all changes are written
+                    bufferPool.unpinPage(firstDataPage.getPageId(), true);
+                    logger.info("Flushing buffer pool after adding SYS_COLUMNS self-reference rows");
+                    bufferPool.flushAll();
+                    
+                } catch (Exception e) {
+                    logger.error("Failed to add column info directly to SYS_COLUMNS: {}", e.getMessage(), e);
+                }
+            }
+            // For SYS_INDEXES, add self-reference entry
+            else if (tableName.equals(SYS_INDEXES)) {
+                try {
+                    logger.info("Attempting to initialize SYS_INDEXES with self-referential data");
+                    
+                    // Get the data page layout
+                    TableDataPageLayout dataLayout = new TableDataPageLayout(firstDataPage);
+                    
+                    // Create row for each system table that has a primary key
+                    String[] systemTables = {
+                        SYS_TABLESPACES, SYS_TABLES, SYS_COLUMNS, SYS_INDEXES, SYS_INDEX_COLUMNS
+                    };
+                    
+                    for (String sysTable : systemTables) {
+                        Map<String, Object> indexRow = new HashMap<>();
+                        indexRow.put("INDEX_NAME", "PK_" + sysTable);
+                        indexRow.put("TABLE_NAME", sysTable);
+                        indexRow.put("TABLESPACE_NAME", SYSTEM_TABLESPACE);
+                        indexRow.put("UNIQUE_FLAG", true);
+                        indexRow.put("ROOT_PAGE_ID", -1); // No actual B-tree for system tables
+                        
+                        logger.info("Creating index entry for {}: PK_{}", sysTable, sysTable);
+                        
+                        // Serialize directly
+                        ObjectMapper mapper = new ObjectMapper();
+                        byte[] rowData = mapper.writeValueAsBytes(indexRow);
+                        
+                        boolean added = dataLayout.addRow(rowData);
+                        if (added) {
+                            logger.info("Successfully added index entry 'PK_{}' to SYS_INDEXES", sysTable);
+                            firstDataPage.markDirty();
+                        } else {
+                            logger.warn("Failed to add index entry 'PK_{}' to SYS_INDEXES", sysTable);
+                        }
+                    }
+                    
+                    // Final flush to ensure all changes are written
+                    bufferPool.unpinPage(firstDataPage.getPageId(), true);
+                    logger.info("Flushing buffer pool after adding SYS_INDEXES self-reference rows");
+                    bufferPool.flushAll();
+                    
+                } catch (Exception e) {
+                    logger.error("Failed to add index directly to SYS_INDEXES: {}", e.getMessage(), e);
+                }
+            }
+            // For SYS_INDEX_COLUMNS, add self-reference entries for all system tables with PKs
+            else if (tableName.equals(SYS_INDEX_COLUMNS)) {
+                try {
+                    logger.info("Attempting to initialize SYS_INDEX_COLUMNS with self-referential data");
+                    
+                    // Get the data page layout
+                    TableDataPageLayout dataLayout = new TableDataPageLayout(firstDataPage);
+                    
+                    // Define the primary key columns for each system table
+                    Map<String, List<String>> systemTablePKs = new HashMap<>();
+                    systemTablePKs.put(SYS_TABLESPACES, Collections.singletonList("TABLESPACE_NAME"));
+                    systemTablePKs.put(SYS_TABLES, Collections.singletonList("TABLE_NAME"));
+                    systemTablePKs.put(SYS_COLUMNS, Arrays.asList("TABLE_NAME", "COLUMN_NAME"));
+                    systemTablePKs.put(SYS_INDEXES, Collections.singletonList("INDEX_NAME"));
+                    systemTablePKs.put(SYS_INDEX_COLUMNS, Arrays.asList("INDEX_NAME", "COLUMN_NAME"));
+                    
+                    // Add entries for each system table's primary key
+                    for (Map.Entry<String, List<String>> entry : systemTablePKs.entrySet()) {
+                        String sysTable = entry.getKey();
+                        List<String> pkColumns = entry.getValue();
+                        
+                        for (int i = 0; i < pkColumns.size(); i++) {
+                            String colName = pkColumns.get(i);
+                            
+                            Map<String, Object> indexColRow = new HashMap<>();
+                            indexColRow.put("INDEX_NAME", "PK_" + sysTable);
+                            indexColRow.put("COLUMN_NAME", colName);
+                            indexColRow.put("COLUMN_POSITION", i);
+                            
+                            logger.info("Creating index column entry: index=PK_{}, column={}, position={}", 
+                                    sysTable, colName, i);
+                            
+                            // Serialize directly
+                            ObjectMapper mapper = new ObjectMapper();
+                            byte[] rowData = mapper.writeValueAsBytes(indexColRow);
+                            
+                            boolean added = dataLayout.addRow(rowData);
+                            if (added) {
+                                logger.info("Successfully added index column entry to SYS_INDEX_COLUMNS: PK_{}.{}", 
+                                        sysTable, colName);
+                                firstDataPage.markDirty();
+                            } else {
+                                logger.warn("Failed to add index column entry to SYS_INDEX_COLUMNS: PK_{}.{}", 
+                                        sysTable, colName);
+                            }
+                        }
+                    }
+                    
+                    // Final flush to ensure all changes are written
+                    bufferPool.unpinPage(firstDataPage.getPageId(), true);
+                    logger.info("Flushing buffer pool after adding SYS_INDEX_COLUMNS self-reference rows");
+                    bufferPool.flushAll();
+                    
+                } catch (Exception e) {
+                    logger.error("Failed to add index columns directly to SYS_INDEX_COLUMNS: {}", e.getMessage(), e);
+                }
             }
             
             logger.info("Created system table '{}' in tablespace '{}'", tableName, SYSTEM_TABLESPACE);
@@ -1045,13 +1293,32 @@ public class SchemaManager {
         // Initialize the page layout
         dataLayout.initialize();
         
+        // Explicitly verify the page type was set correctly
+        PageType pageType = dataLayout.getPageType();
+        if (pageType != PageType.TABLE_DATA) {
+            logger.error("Page initialization failure - expected TABLE_DATA but got {}", pageType);
+            // If wrong page type, reinitialize the layout 
+            dataLayout.initialize();
+        }
+        
+        // Set initial row count to 0 explicitly
+        dataLayout.setRowCount(0);
+        
+        // Check that free space is properly initialized
+        if (dataLayout.getFreeSpace() <= 0) {
+            logger.error("Page has no free space after initialization, recreating page");
+            dataLayout.initialize();
+        }
+        
         // Mark the page as dirty to ensure changes are persisted
         dataPage.markDirty();
         
         // Set the first data page ID in the table object if applicable
         if (dataPage.getPageId() != null) {
-            logger.debug("Initialized table data page {} with type {}", 
-                    dataPage.getPageId().getPageNumber(), PageType.TABLE_DATA);
+            logger.debug("Initialized table data page {} with type {} and free space {}", 
+                    dataPage.getPageId().getPageNumber(), 
+                    PageType.TABLE_DATA,
+                    dataLayout.getFreeSpace());
         }
     }
     
