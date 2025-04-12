@@ -26,6 +26,14 @@ jobs:
       - name: Build with Gradle
         run: ./gradlew build
 
+      - name: Publish Test Results
+        uses: actions/upload-artifact@v4
+        if: success() || failure()
+        with:
+          name: test-results
+          path: build/test-results/**/*.xml
+          retention-days: 7
+
       - name: Build Shadow JAR
         run: ./gradlew shadowJar
 
