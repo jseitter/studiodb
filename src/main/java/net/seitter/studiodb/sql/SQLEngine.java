@@ -366,7 +366,6 @@ public class SQLEngine {
         String columnsStr = matcher.group(2);
         String valuesStr = matcher.group(3);
         
-        // For educational purposes, we'll just pretend to insert the data
         SchemaManager schemaManager = dbSystem.getSchemaManager();
         Table table = schemaManager.getTable(tableName);
         
@@ -435,80 +434,13 @@ public class SQLEngine {
             row.put(columnName, convertedValue);
         }
         
-        // Validate the row
-        if (!table.validateRow(row)) {
-            return "Invalid row data";
-        }
+        // Use the new insertRow method to handle the insertion
+        boolean success = schemaManager.insertRow(tableName, row);
         
-        // Get the buffer pool for the tablespace
-        IBufferPoolManager bufferPool = dbSystem.getBufferPoolManager(table.getTablespaceName());
-        if (bufferPool == null) {
-            return "Error: Tablespace '" + table.getTablespaceName() + "' not found";
-        }
-        
-        // Get the header page
-        PageId headerPageId = new PageId(table.getTablespaceName(), table.getHeaderPageId());
-        Page headerPage = bufferPool.fetchPage(headerPageId);
-        if (headerPage == null) {
-            bufferPool.unpinPage(headerPageId, false);
-            return "Error: Header page not found";
-        }
-        
-        // Use PageLayout to work with the header page
-        TableHeaderPageLayout headerLayout = (TableHeaderPageLayout) PageLayoutFactory.createLayout(headerPage);
-        if (headerLayout == null) {
-            bufferPool.unpinPage(headerPageId, false);
-            return "Error: Invalid header page format";
-        }
-        
-        // Get the first data page ID using the correct method from TableHeaderPageLayout
-        int firstDataPageId = headerLayout.getFirstDataPageId();
-        bufferPool.unpinPage(headerPageId, false);
-        
-        // Get the data page
-        PageId dataPageId = new PageId(table.getTablespaceName(), firstDataPageId);
-        Page dataPage = bufferPool.fetchPage(dataPageId);
-        if (dataPage == null) {
-            return "Error: Data page not found";
-        }
-        
-        try {
-            // Create a TableDataPageLayout to work with the data page
-            TableDataPageLayout dataLayout = (TableDataPageLayout) PageLayoutFactory.createLayout(dataPage);
-            if (dataLayout == null) {
-                bufferPool.unpinPage(dataPageId, false);
-                return "Error: Invalid data page format";
-            }
-            
-            // Serialize the row data
-            byte[] rowData;
-            try {
-                rowData = serializeRow(row);
-            } catch (IOException e) {
-                logger.error("Error serializing row data", e);
-                return "Error: Failed to serialize row data";
-            }
-            
-            // Check if there's enough space and add the row
-            if (!dataLayout.addRow(rowData)) {
-                bufferPool.unpinPage(dataPageId, false);
-                return "Error: Not enough space in data page";
-            }
-            
-            // Unpin the data page
-            bufferPool.unpinPage(dataPageId, true);
-            
-            // Force flush all pages to ensure they are written to disk
-            try {
-                bufferPool.flushAll();
-            } catch (IOException e) {
-                logger.error("Error flushing buffer pool after insert", e);
-                return "Error: Failed to flush changes to disk";
-            }
-            
+        if (success) {
             return "Inserted 1 row into table '" + tableName + "'";
-        } finally {
-            // Remove the unpin from finally block since we already unpinned above
+        } else {
+            return "Failed to insert row into table '" + tableName + "'";
         }
     }
     
@@ -532,7 +464,6 @@ public class SQLEngine {
         String tableName = matcher.group(2);
         String whereClause = matcher.group(3);
         
-        // For educational purposes, we'll just pretend to select the data
         SchemaManager schemaManager = dbSystem.getSchemaManager();
         Table table = schemaManager.getTable(tableName);
         
@@ -564,14 +495,211 @@ public class SQLEngine {
             }
         }
         
-        // For educational purposes, we'll just return a mock result
-        StringBuilder sb = new StringBuilder();
-        sb.append("Selected columns: ").append(String.join(", ", columnNames));
-        sb.append(" from table '").append(tableName).append("'");
-        
-        if (whereClause != null) {
-            sb.append(" where ").append(whereClause);
+        try {
+            // Fetch data from the table
+            List<Map<String, Object>> rows = fetchTableData(table, columnNames, whereClause);
+            return formatSelectResults(columnNames, rows);
+        } catch (Exception e) {
+            logger.error("Error executing SELECT query", e);
+            return "Error executing query: " + e.getMessage();
         }
+    }
+    
+    /**
+     * Fetches data from a table based on selected columns and where clause.
+     *
+     * @param table The table to fetch from
+     * @param columnNames The columns to fetch
+     * @param whereClause The where clause for filtering rows, or null if no filtering
+     * @return A list of rows as maps of column name to value
+     * @throws IOException If there's an error reading from storage
+     */
+    private List<Map<String, Object>> fetchTableData(Table table, List<String> columnNames, 
+                                                   String whereClause) throws IOException {
+        List<Map<String, Object>> result = new ArrayList<>();
+        
+        // Get the buffer pool for the table's tablespace
+        IBufferPoolManager bufferPool = dbSystem.getBufferPoolManager(table.getTablespaceName());
+        if (bufferPool == null) {
+            throw new IOException("Buffer pool not found for tablespace: " + table.getTablespaceName());
+        }
+        
+        // Get the header page to find the first data page
+        PageId headerPageId = new PageId(table.getTablespaceName(), table.getHeaderPageId());
+        Page headerPage = bufferPool.fetchPage(headerPageId);
+        
+        if (headerPage == null) {
+            throw new IOException("Header page not found for table: " + table.getName());
+        }
+        
+        try {
+            // Create header page layout
+            TableHeaderPageLayout headerLayout = new TableHeaderPageLayout(headerPage);
+            
+            // Get the first data page ID
+            int firstDataPageId = headerLayout.getFirstDataPageId();
+            
+            // If there are no data pages, return empty result
+            if (firstDataPageId == -1) {
+                return result;
+            }
+            
+            // Traverse through the chain of data pages
+            int currentPageId = firstDataPageId;
+            com.fasterxml.jackson.databind.ObjectMapper mapper = new com.fasterxml.jackson.databind.ObjectMapper();
+            mapper.registerModule(new com.fasterxml.jackson.datatype.jsr310.JavaTimeModule());
+            
+            while (currentPageId != -1) {
+                PageId dataPageId = new PageId(table.getTablespaceName(), currentPageId);
+                Page dataPage = bufferPool.fetchPage(dataPageId);
+                
+                if (dataPage == null) {
+                    logger.error("Data page not found: {}", dataPageId);
+                    break;
+                }
+                
+                try {
+                    // Create data page layout
+                    TableDataPageLayout dataLayout = new TableDataPageLayout(dataPage);
+                    
+                    // Get number of rows in this page
+                    int rowCount = dataLayout.getRowCount();
+                    
+                    // Process each row
+                    for (int i = 0; i < rowCount; i++) {
+                        byte[] rowData = dataLayout.getRow(i);
+                        
+                        if (rowData != null) {
+                            try {
+                                // Deserialize the row
+                                Map<String, Object> row = mapper.readValue(rowData, 
+                                    new com.fasterxml.jackson.core.type.TypeReference<Map<String, Object>>() {});
+                                
+                                // Filter row based on where clause if present
+                                if (whereClause == null || evaluateWhereClause(row, whereClause)) {
+                                    // Project only requested columns
+                                    Map<String, Object> projectedRow = new HashMap<>();
+                                    for (String columnName : columnNames) {
+                                        projectedRow.put(columnName, row.get(columnName));
+                                    }
+                                    
+                                    result.add(projectedRow);
+                                }
+                            } catch (Exception e) {
+                                logger.error("Error deserializing row: {}", e.getMessage());
+                                // Continue with next row
+                            }
+                        }
+                    }
+                    
+                    // Get next page ID
+                    currentPageId = dataLayout.getNextPageId();
+                } finally {
+                    // Unpin the data page
+                    bufferPool.unpinPage(dataPageId, false);
+                }
+            }
+        } finally {
+            // Unpin the header page
+            bufferPool.unpinPage(headerPageId, false);
+        }
+        
+        return result;
+    }
+    
+    /**
+     * Evaluates the where clause for a single row.
+     * This is a simple implementation that only supports basic conditions.
+     *
+     * @param row The row to evaluate
+     * @param whereClause The where clause to evaluate
+     * @return true if the row matches the where clause, false otherwise
+     */
+    private boolean evaluateWhereClause(Map<String, Object> row, String whereClause) {
+        // Simple equality condition: column = value
+        Pattern equalsPattern = Pattern.compile("(\\w+)\\s*=\\s*([^\\s]+)");
+        Matcher matcher = equalsPattern.matcher(whereClause);
+        
+        if (matcher.matches()) {
+            String columnName = matcher.group(1);
+            String value = matcher.group(2);
+            
+            // Remove quotes from string values
+            if (value.startsWith("'") && value.endsWith("'")) {
+                value = value.substring(1, value.length() - 1);
+            }
+            
+            Object rowValue = row.get(columnName);
+            
+            // If value in row is null, it doesn't match
+            if (rowValue == null) {
+                return false;
+            }
+            
+            // Convert both to strings for comparison
+            return rowValue.toString().equals(value);
+        }
+        
+        // For more complex conditions, return true for now
+        // In a full implementation, we would need to parse and evaluate complex expressions
+        logger.warn("Complex WHERE clause not fully supported: {}", whereClause);
+        return true;
+    }
+    
+    /**
+     * Formats the results of a SELECT query into a human-readable string.
+     *
+     * @param columnNames The column names
+     * @param rows The rows of data
+     * @return A formatted string representing the results
+     */
+    private String formatSelectResults(List<String> columnNames, List<Map<String, Object>> rows) {
+        if (rows.isEmpty()) {
+            return "No rows found.";
+        }
+        
+        StringBuilder sb = new StringBuilder();
+        
+        // Calculate column widths
+        Map<String, Integer> columnWidths = new HashMap<>();
+        for (String columnName : columnNames) {
+            columnWidths.put(columnName, columnName.length());
+        }
+        
+        // Find the maximum width for each column
+        for (Map<String, Object> row : rows) {
+            for (String columnName : columnNames) {
+                Object value = row.get(columnName);
+                String displayValue = value != null ? value.toString() : "NULL";
+                columnWidths.put(columnName, Math.max(columnWidths.get(columnName), displayValue.length()));
+            }
+        }
+        
+        // Format header
+        for (String columnName : columnNames) {
+            sb.append(String.format("%-" + (columnWidths.get(columnName) + 2) + "s", columnName));
+        }
+        sb.append("\n");
+        
+        // Format separator
+        for (String columnName : columnNames) {
+            for (int i = 0; i < columnWidths.get(columnName) + 2; i++) {
+                sb.append("-");
+            }
+        }
+        sb.append("\n");
+        
+        // Format rows
+        for (Map<String, Object> row : rows) {
+            for (String columnName : columnNames) {
+                Object value = row.get(columnName);
+                String displayValue = value != null ? value.toString() : "NULL";
+                sb.append(String.format("%-" + (columnWidths.get(columnName) + 2) + "s", displayValue));
+            }
+            sb.append("\n");
+        }
+        
+        sb.append("\n").append(rows.size()).append(" row(s) returned.");
         
         return sb.toString();
     }
@@ -1216,9 +1344,12 @@ public class SQLEngine {
      *
      * @param row The row to serialize
      * @return The serialized row as a byte array
+     * @throws IOException If there's an error serializing the row
      */
     private byte[] serializeRow(Map<String, Object> row) throws IOException {
         com.fasterxml.jackson.databind.ObjectMapper mapper = new com.fasterxml.jackson.databind.ObjectMapper();
+        // Register JSR310 module for LocalDate support
+        mapper.registerModule(new com.fasterxml.jackson.datatype.jsr310.JavaTimeModule());
         return mapper.writeValueAsBytes(row);
     }
 } 

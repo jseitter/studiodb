@@ -1591,4 +1591,194 @@ public class SchemaManager {
             return null;
         }
     }
+
+    /**
+     * Inserts a row into a user table.
+     *
+     * @param tableName The name of the table
+     * @param row The row data as a map of column names to values
+     * @return true if the row was inserted successfully
+     * @throws IOException If there's an error writing to the tablespace
+     */
+    public boolean insertRow(String tableName, Map<String, Object> row) throws IOException {
+        // Get the table object
+        Table table = tables.get(tableName);
+        if (table == null) {
+            logger.error("Cannot insert into table '{}': table not found", tableName);
+            return false;
+        }
+        
+        // Validate the row data
+        if (!table.validateRow(row)) {
+            logger.error("Cannot insert into table '{}': invalid row data", tableName);
+            return false;
+        }
+        
+        try {
+            // Get the buffer pool for the table's tablespace
+            IBufferPoolManager bufferPool = dbSystem.getBufferPoolManager(table.getTablespaceName());
+            if (bufferPool == null) {
+                logger.error("Cannot insert into table '{}': buffer pool not found for tablespace '{}'", 
+                        tableName, table.getTablespaceName());
+                return false;
+            }
+            
+            // Get the header page
+            int headerPageNumber = table.getHeaderPageId();
+            PageId headerPageId = new PageId(table.getTablespaceName(), headerPageNumber);
+            
+            // Fetch the header page
+            Page headerPage = bufferPool.fetchPage(headerPageId);
+            if (headerPage == null) {
+                logger.error("Cannot insert into table '{}': header page not found", tableName);
+                return false;
+            }
+            
+            // Get the table header layout
+            TableHeaderPageLayout headerLayout = new TableHeaderPageLayout(headerPage);
+            
+            // Get the first data page ID
+            int firstDataPageId = headerLayout.getFirstDataPageId();
+            if (firstDataPageId == -1) {
+                // Allocate a new data page if none exists
+                Page newDataPage = bufferPool.allocatePage();
+                if (newDataPage == null) {
+                    logger.error("Failed to allocate new data page for table '{}'", tableName);
+                    bufferPool.unpinPage(headerPageId, false);
+                    return false;
+                }
+                
+                // Initialize the data page
+                TableDataPageLayout newDataLayout = new TableDataPageLayout(newDataPage);
+                newDataLayout.initialize();
+                
+                // Update the header with this new page ID
+                firstDataPageId = newDataPage.getPageId().getPageNumber();
+                headerLayout.setFirstDataPageId(firstDataPageId);
+                headerPage.markDirty();
+                
+                // Also update the table object
+                table.setFirstDataPageId(firstDataPageId);
+                
+                // Unpin the new page for now
+                bufferPool.unpinPage(newDataPage.getPageId(), true);
+                logger.debug("Allocated first data page {} for table '{}'", firstDataPageId, tableName);
+            }
+            
+            // Unpin the header page as we no longer need it
+            bufferPool.unpinPage(headerPageId, headerPage.isDirty());
+            
+            // Serialize the row
+            byte[] rowData = serializeRow(row);
+            
+            // Try to insert into the chain of data pages
+            boolean inserted = false;
+            PageId currentDataPageId = new PageId(table.getTablespaceName(), firstDataPageId);
+            
+            while (!inserted) {
+                Page dataPage = bufferPool.fetchPage(currentDataPageId);
+                if (dataPage == null) {
+                    logger.error("Data page {} for table '{}' not found", currentDataPageId, tableName);
+                    return false;
+                }
+                
+                TableDataPageLayout dataLayout = new TableDataPageLayout(dataPage);
+                
+                // Check if there's enough space in this page
+                if (dataLayout.getFreeSpace() >= rowData.length + TableDataPageLayout.ROW_DIRECTORY_ENTRY_SIZE) {
+                    // Add the row to this page
+                    if (dataLayout.addRow(rowData)) {
+                        inserted = true;
+                        dataPage.markDirty();
+                        logger.debug("Inserted row into table '{}' on page {}", tableName, currentDataPageId);
+                    } else {
+                        logger.error("Failed to add row to page {} despite space check", currentDataPageId);
+                    }
+                    
+                    bufferPool.unpinPage(currentDataPageId, dataPage.isDirty());
+                } else {
+                    // Not enough space - check for next page
+                    int nextPageId = dataLayout.getNextPageId();
+                    
+                    if (nextPageId != -1) {
+                        // Move to the next page in the chain
+                        bufferPool.unpinPage(currentDataPageId, false);
+                        currentDataPageId = new PageId(table.getTablespaceName(), nextPageId);
+                    } else {
+                        // This is the last page and it doesn't have enough space
+                        // We need to allocate a new page and link it
+                        Page newDataPage = bufferPool.allocatePage();
+                        if (newDataPage == null) {
+                            logger.error("Failed to allocate new data page for table '{}'", tableName);
+                            bufferPool.unpinPage(currentDataPageId, false);
+                            return false;
+                        }
+                        
+                        // Initialize the new page
+                        TableDataPageLayout newDataLayout = new TableDataPageLayout(newDataPage);
+                        newDataLayout.initialize();
+                        
+                        // Link the pages
+                        dataLayout.setNextPageId(newDataPage.getPageId().getPageNumber());
+                        dataPage.markDirty();
+                        bufferPool.unpinPage(currentDataPageId, true);
+                        
+                        // Try to add the row to the new page
+                        if (newDataLayout.addRow(rowData)) {
+                            inserted = true;
+                            newDataPage.markDirty();
+                            logger.debug("Inserted row into table '{}' on new page {}", 
+                                tableName, newDataPage.getPageId());
+                        } else {
+                            logger.error("Failed to add row to new page {} - this should not happen", newDataPage.getPageId());
+                        }
+                        
+                        bufferPool.unpinPage(newDataPage.getPageId(), true);
+                    }
+                }
+            }
+            
+            // Update indexes if insertion was successful
+            if (inserted) {
+                updateIndexesForInsertedRow(table, row);
+            }
+            
+            return inserted;
+        } catch (Exception e) {
+            logger.error("Failed to insert row into table '{}'", tableName, e);
+            return false;
+        }
+    }
+    
+    /**
+     * Updates all indexes for a table when a new row is inserted.
+     *
+     * @param table The table
+     * @param row The inserted row data
+     */
+    private void updateIndexesForInsertedRow(Table table, Map<String, Object> row) {
+        List<Index> indexList = tableIndexes.get(table.getName());
+        if (indexList == null || indexList.isEmpty()) {
+            return; // No indexes to update
+        }
+        
+        try {
+            for (Index index : indexList) {
+                // Extract the key values from the row
+                List<Object> keyValues = new ArrayList<>();
+                for (String columnName : index.getColumnNames()) {
+                    keyValues.add(row.get(columnName));
+                }
+                
+                // For now, just log that we would update the index
+                // Actual B-tree update implementation would go here
+                logger.debug("Would update index '{}' for table '{}' with key values: {}", 
+                        index.getName(), table.getName(), keyValues);
+                
+                // TODO: Implement actual B-tree index update
+            }
+        } catch (Exception e) {
+            logger.error("Failed to update indexes for table '{}'", table.getName(), e);
+        }
+    }
 } 
