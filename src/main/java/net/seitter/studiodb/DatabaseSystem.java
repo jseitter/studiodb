@@ -64,6 +64,18 @@ public class DatabaseSystem {
         // Initialize schema manager
         this.schemaManager = new SchemaManager(this);
         
+        // Load tablespaces from the system catalog
+        try {
+            boolean loaded = schemaManager.loadTablespacesFromCatalog();
+            if (loaded) {
+                logger.info("Successfully loaded tablespaces from system catalog");
+            } else {
+                logger.warn("Failed to load tablespaces from system catalog");
+            }
+        } catch (Exception e) {
+            logger.error("Error loading tablespaces from system catalog", e);
+        }
+        
         logger.info("Database system initialized with page size: {} bytes", DEFAULT_PAGE_SIZE);
     }
     

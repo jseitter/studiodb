@@ -22,6 +22,8 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Arrays;
+import java.util.HashSet;
+import java.util.Set;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 
@@ -93,6 +95,26 @@ public class SchemaManager {
             if (systemBufferPool == null) {
                 logger.error("Cannot initialize system catalog: system tablespace not found");
                 return false;
+            }
+
+            // Check if the system tables already exist on disk by attempting to read SYS_TABLES table header
+            try {
+                int existingTableHeaderId = findExistingTableHeaderPage(SYS_TABLES);
+                if (existingTableHeaderId > 0) {
+                    logger.info("System catalog tables already exist on disk, skipping creation");
+                    
+                    // Load the existing tables into memory
+                    loadExistingTable(SYS_TABLESPACES);
+                    loadExistingTable(SYS_TABLES);
+                    loadExistingTable(SYS_COLUMNS);
+                    loadExistingTable(SYS_INDEXES);
+                    loadExistingTable(SYS_INDEX_COLUMNS);
+                    
+                    return true;
+                }
+            } catch (Exception e) {
+                logger.warn("Failed to check for existing system tables: {}", e.getMessage());
+                // Continue with table creation since we couldn't verify they exist
             }
             
             boolean allTablesCreated = true;
@@ -634,14 +656,143 @@ public class SchemaManager {
      * 
      * @return true if loading was successful
      */
-    private boolean loadTablespacesFromCatalog() {
-        // For now, we're just defining the interface
-        // The actual implementation would involve reading from SYS_TABLESPACES
-        // and reconstruct existing tablespaces
-        
-        // This would be completed in a future implementation
-        logger.info("Tablespace loading from catalog not fully implemented yet");
-        return true;
+    public boolean loadTablespacesFromCatalog() {
+        try {
+            logger.info("Loading tablespaces from system catalog...");
+            
+            // First, check if SYS_TABLESPACES table exists
+            if (!tableExists(SYS_TABLESPACES)) {
+                logger.warn("SYS_TABLESPACES table does not exist, cannot load tablespaces");
+                return false;
+            }
+            
+            // Retrieve the system buffer pool manager
+            IBufferPoolManager systemBufferPool = dbSystem.getBufferPoolManager(SYSTEM_TABLESPACE);
+            if (systemBufferPool == null) {
+                logger.error("Cannot load tablespaces: system buffer pool not found");
+                return false;
+            }
+            
+            // Query the SYS_TABLESPACES table to get all tablespaces
+            net.seitter.studiodb.buffer.BufferPoolUtils.SafePageOperationChain<List<Map<String, Object>>> operation = 
+                (bp) -> {
+                    Table tablespaceTable = tables.get(SYS_TABLESPACES);
+                    if (tablespaceTable == null) {
+                        logger.error("SYS_TABLESPACES table not found in memory");
+                        return null;
+                    }
+                    
+                    // Load tablespaces data
+                    List<Map<String, Object>> tablespaces = new ArrayList<>();
+                    
+                    // Get the first data page ID
+                    PageId headerPageId = new PageId(SYSTEM_TABLESPACE, tablespaceTable.getHeaderPageId());
+                    
+                    // Use withPage to get the first data page ID
+                    Integer firstDataPageId = net.seitter.studiodb.buffer.BufferPoolUtils.withPage(
+                        bp, headerPageId, false, headerPage -> {
+                            if (headerPage == null) {
+                                logger.error("Header page for table '{}' not found", SYS_TABLESPACES);
+                                return null;
+                            }
+                            
+                            TableHeaderPageLayout headerLayout = new TableHeaderPageLayout(headerPage);
+                            return headerLayout.getFirstDataPageId();
+                        });
+                    
+                    if (firstDataPageId == null || firstDataPageId == -1) {
+                        logger.info("No tablespaces found in system catalog (no data pages)");
+                        return tablespaces; // Empty list
+                    }
+                    
+                    // Track visited pages to avoid circular references
+                    Set<Integer> visitedPageIds = new HashSet<>();
+                    int currentPageId = firstDataPageId;
+                    
+                    // Read all the data pages
+                    while (currentPageId != -1 && !visitedPageIds.contains(currentPageId)) {
+                        visitedPageIds.add(currentPageId);
+                        
+                        final int pageToRead = currentPageId;
+                        Integer nextPageId = net.seitter.studiodb.buffer.BufferPoolUtils.withPage(
+                            bp, new PageId(SYSTEM_TABLESPACE, pageToRead), false, dataPage -> {
+                                if (dataPage == null) {
+                                    logger.error("Data page {} for table '{}' not found", pageToRead, SYS_TABLESPACES);
+                                    return null;
+                                }
+                                
+                                TableDataPageLayout dataLayout = new TableDataPageLayout(dataPage);
+                                
+                                // Read rows from this page
+                                try {
+                                    for (int i = 0; i < dataLayout.getRowCount(); i++) {
+                                        byte[] rowData = dataLayout.getRow(i);
+                                        if (rowData != null) {
+                                            Map<String, Object> row = deserializeRow(rowData);
+                                            tablespaces.add(row);
+                                        }
+                                    }
+                                } catch (Exception e) {
+                                    logger.error("Error reading rows from page {}", pageToRead, e);
+                                }
+                                
+                                // Return the next page ID
+                                return dataLayout.getNextPageId();
+                            });
+                        
+                        if (nextPageId == null) {
+                            break; // Error occurred
+                        }
+                        
+                        currentPageId = nextPageId;
+                    }
+                    
+                    return tablespaces;
+                };
+            
+            List<Map<String, Object>> tablespaces = net.seitter.studiodb.buffer.BufferPoolUtils.withSafeOperations(
+                systemBufferPool, operation);
+            
+            if (tablespaces == null) {
+                logger.error("Failed to retrieve tablespaces from system catalog");
+                return false;
+            }
+            
+            // Ignore the system tablespace since it's already loaded
+            int created = 0;
+            for (Map<String, Object> row : tablespaces) {
+                String tablespaceName = (String) row.get("TABLESPACE_NAME");
+                
+                // Skip the system tablespace, it's already loaded
+                if (SYSTEM_TABLESPACE.equals(tablespaceName)) {
+                    continue;
+                }
+                
+                String containerPath = (String) row.get("CONTAINER_PATH");
+                int pageSize = ((Number) row.get("PAGE_SIZE")).intValue();
+                
+                // If the tablespace is not already loaded, create it
+                if (dbSystem.getStorageManager().getTablespace(tablespaceName) == null) {
+                    // We determine a reasonable initial size (it will be expanded if needed)
+                    int initialSize = 100; // Default size
+                    
+                    // Try to create/load the tablespace
+                    boolean success = dbSystem.createTablespace(tablespaceName, containerPath, initialSize);
+                    if (success) {
+                        logger.info("Loaded tablespace '{}' from system catalog", tablespaceName);
+                        created++;
+                    } else {
+                        logger.error("Failed to load tablespace '{}' from system catalog", tablespaceName);
+                    }
+                }
+            }
+            
+            logger.info("Loaded {} tablespaces from system catalog", created);
+            return true;
+        } catch (Exception e) {
+            logger.error("Error loading tablespaces from system catalog", e);
+            return false;
+        }
     }
     
     /**
@@ -1853,6 +2004,118 @@ public class SchemaManager {
             }
         } catch (Exception e) {
             logger.error("Failed to update indexes for table '{}'", table.getName(), e);
+        }
+    }
+
+    // Add deserializeRow method
+    private Map<String, Object> deserializeRow(byte[] rowData) throws IOException {
+        com.fasterxml.jackson.databind.ObjectMapper mapper = new com.fasterxml.jackson.databind.ObjectMapper();
+        return mapper.readValue(rowData, Map.class);
+    }
+
+    /**
+     * Find an existing table header page ID in the system tablespace
+     * 
+     * @param tableName The name of the table to look for
+     * @return The header page ID if found, or -1 if not found
+     * @throws IOException If an I/O error occurs
+     */
+    private int findExistingTableHeaderPage(String tableName) throws IOException {
+        // Get the buffer pool for the system tablespace
+        IBufferPoolManager systemBufferPool = dbSystem.getBufferPoolManager(SYSTEM_TABLESPACE);
+        if (systemBufferPool == null) {
+            logger.error("Cannot find table {}: system buffer pool not found", tableName);
+            return -1;
+        }
+        
+        // Try to scan the first few pages to find the table header
+        // This is a simplified approach - in a real system, we would have a page directory
+        for (int pageNumber = 0; pageNumber < 20; pageNumber++) {
+            PageId pageId = new PageId(SYSTEM_TABLESPACE, pageNumber);
+            Page page = null;
+            try {
+                page = systemBufferPool.fetchPage(pageId);
+                if (page == null) continue;
+                
+                // Check if this is a table header page
+                PageLayout layout = PageLayoutFactory.createLayout(page);
+                if (layout == null || layout.getPageType() != PageType.TABLE_HEADER) {
+                    systemBufferPool.unpinPage(pageId, false);
+                    continue;
+                }
+                
+                // For table header pages, check if this is the table we're looking for
+                TableHeaderPageLayout headerLayout = (TableHeaderPageLayout) layout;
+                String pageTableName = headerLayout.getTableName();
+                
+                if (tableName.equals(pageTableName)) {
+                    systemBufferPool.unpinPage(pageId, false);
+                    return pageNumber;
+                }
+                
+                systemBufferPool.unpinPage(pageId, false);
+            } catch (Exception e) {
+                logger.warn("Error inspecting page {}: {}", pageNumber, e.getMessage());
+                if (page != null) {
+                    systemBufferPool.unpinPage(pageId, false);
+                }
+            }
+        }
+        
+        return -1;
+    }
+    
+    /**
+     * Load an existing table from disk into the schema manager's memory structures
+     * 
+     * @param tableName The name of the table to load
+     * @return true if the table was loaded successfully, false otherwise
+     */
+    private boolean loadExistingTable(String tableName) {
+        try {
+            IBufferPoolManager systemBufferPool = dbSystem.getBufferPoolManager(SYSTEM_TABLESPACE);
+            if (systemBufferPool == null) {
+                logger.error("Cannot load table {}: system buffer pool not found", tableName);
+                return false;
+            }
+            
+            // Find the header page
+            int headerPageId = findExistingTableHeaderPage(tableName);
+            if (headerPageId < 0) {
+                logger.warn("Could not find header page for table: {}", tableName);
+                return false;
+            }
+            
+            // Load the table header
+            PageId pageId = new PageId(SYSTEM_TABLESPACE, headerPageId);
+            Page headerPage = systemBufferPool.fetchPage(pageId);
+            if (headerPage == null) {
+                logger.error("Failed to fetch header page {} for table {}", headerPageId, tableName);
+                return false;
+            }
+            
+            try {
+                TableHeaderPageLayout headerLayout = new TableHeaderPageLayout(headerPage);
+                
+                // Create a table object to represent this table
+                Table table = new Table(tableName, SYSTEM_TABLESPACE);
+                table.setHeaderPageId(headerPageId);
+                table.setFirstDataPageId(headerLayout.getFirstDataPageId());
+                
+                // Store the table in our schema
+                tables.put(tableName, table);
+                tableIndexes.put(tableName, new ArrayList<>());
+                
+                logger.info("Loaded existing table {} from header page {}", tableName, headerPageId);
+                return true;
+                
+            } finally {
+                systemBufferPool.unpinPage(pageId, false);
+            }
+            
+        } catch (Exception e) {
+            logger.error("Error loading existing table {}: {}", tableName, e.getMessage());
+            return false;
         }
     }
 } 

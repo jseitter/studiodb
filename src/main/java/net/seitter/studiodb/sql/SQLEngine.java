@@ -32,6 +32,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import java.util.HashSet;
+import java.util.Set;
 
 /**
  * Parses and executes SQL statements.
@@ -932,40 +934,151 @@ public class SQLEngine {
         sb.append(String.format("%-20s %-30s %-15s %-15s\n", 
                 "--------------------", "------------------------------", "---------------", "---------------"));
         
+        // Get tablespaces from the system catalog
+        SchemaManager schemaManager = dbSystem.getSchemaManager();
         StorageManager storageManager = dbSystem.getStorageManager();
-        Map<String, Tablespace> tablespaces = new HashMap<>();
         
-        // Get all tablespaces through reflection since it's private in StorageManager
+        if (schemaManager == null) {
+            return "Schema manager not initialized.";
+        }
+        
+        // Get the SYS_TABLESPACES table
+        String sysTablespaceName = SchemaManager.SYS_TABLESPACES;
+        Table tablespaceTable = schemaManager.getTable(sysTablespaceName);
+        
+        if (tablespaceTable == null) {
+            return "System catalog table not found: " + sysTablespaceName;
+        }
+        
         try {
-            java.lang.reflect.Field tablespacesField = StorageManager.class.getDeclaredField("tablespaces");
-            tablespacesField.setAccessible(true);
-            tablespaces = (Map<String, Tablespace>) tablespacesField.get(storageManager);
-        } catch (Exception e) {
-            logger.error("Failed to get tablespaces", e);
-            return "Failed to retrieve tablespace information: " + e.getMessage();
-        }
-        
-        if (tablespaces.isEmpty()) {
-            return "No tablespaces found.";
-        }
-        
-        for (Tablespace tablespace : tablespaces.values()) {
-            String name = tablespace.getName();
-            String location = tablespace.getStorageContainer().getContainerPath();
-            int pageSize = tablespace.getPageSize();
-            int totalPages;
+            // Execute a simplified SELECT-like operation on SYS_TABLESPACES
+            String query = "SELECT * FROM " + sysTablespaceName;
+            List<Map<String, Object>> rows = new ArrayList<>();
             
-            try {
-                totalPages = tablespace.getTotalPages();
-            } catch (IOException e) {
-                totalPages = -1;
+            // This is a simplified approach - in a real implementation, 
+            // we would use the query engine to do this
+            IBufferPoolManager systemBpm = dbSystem.getBufferPoolManager(SchemaManager.SYSTEM_TABLESPACE);
+            if (systemBpm == null) {
+                return "System buffer pool not found.";
             }
             
-            sb.append(String.format("%-20s %-30s %-15d %-15d\n", 
-                    name, location, totalPages, pageSize));
+            // Get all rows from SYS_TABLESPACES
+            rows = executeSelectInternal(tablespaceTable, systemBpm);
+            
+            if (rows.isEmpty()) {
+                return "No tablespaces found in system catalog.";
+            }
+            
+            // Format the rows
+            for (Map<String, Object> row : rows) {
+                String name = (String) row.get("TABLESPACE_NAME");
+                String location = (String) row.get("CONTAINER_PATH");
+                int pageSize = ((Number) row.get("PAGE_SIZE")).intValue();
+                
+                // Get totalPages from StorageManager
+                int totalPages = -1;
+                Tablespace tablespace = storageManager.getTablespace(name);
+                if (tablespace != null) {
+                    try {
+                        totalPages = tablespace.getTotalPages();
+                    } catch (IOException e) {
+                        logger.warn("Error getting total pages for tablespace '{}'", name, e);
+                    }
+                }
+                
+                sb.append(String.format("%-20s %-30s %-15d %-15d\n", 
+                        name, location, totalPages, pageSize));
+            }
+            
+            return sb.toString();
+        } catch (Exception e) {
+            logger.error("Error retrieving tablespace information", e);
+            return "Error retrieving tablespace information: " + e.getMessage();
+        }
+    }
+    
+    /**
+     * Executes a simplified internal SELECT operation on a system table.
+     * 
+     * @param table The table to select from
+     * @param bufferPool The buffer pool to use
+     * @return A list of rows from the table
+     * @throws IOException If there's an error reading from the table
+     */
+    private List<Map<String, Object>> executeSelectInternal(Table table, IBufferPoolManager bufferPool) 
+            throws IOException {
+        List<Map<String, Object>> results = new ArrayList<>();
+        
+        // Read the header page to get the first data page
+        PageId headerPageId = new PageId(table.getTablespaceName(), table.getHeaderPageId());
+        Page headerPage = bufferPool.fetchPage(headerPageId);
+        
+        if (headerPage == null) {
+            logger.error("Header page for table '{}' not found", table.getName());
+            bufferPool.unpinPage(headerPageId, false);
+            return results;
         }
         
-        return sb.toString();
+        try {
+            TableHeaderPageLayout headerLayout = new TableHeaderPageLayout(headerPage);
+            int firstDataPageId = headerLayout.getFirstDataPageId();
+            
+            if (firstDataPageId == -1) {
+                // No data pages
+                return results;
+            }
+            
+            // Track visited page IDs to avoid circular references
+            Set<Integer> visitedPageIds = new HashSet<>();
+            int currentPageId = firstDataPageId;
+            
+            // Read all data pages
+            while (currentPageId != -1 && !visitedPageIds.contains(currentPageId)) {
+                visitedPageIds.add(currentPageId);
+                
+                PageId dataPageId = new PageId(table.getTablespaceName(), currentPageId);
+                Page dataPage = bufferPool.fetchPage(dataPageId);
+                
+                if (dataPage == null) {
+                    logger.error("Data page {} for table '{}' not found", currentPageId, table.getName());
+                    break;
+                }
+                
+                try {
+                    TableDataPageLayout dataLayout = new TableDataPageLayout(dataPage);
+                    
+                    // Read all rows in this page
+                    for (int i = 0; i < dataLayout.getRowCount(); i++) {
+                        byte[] rowData = dataLayout.getRow(i);
+                        if (rowData != null) {
+                            Map<String, Object> row = deserializeRow(rowData);
+                            results.add(row);
+                        }
+                    }
+                    
+                    // Get next page ID
+                    currentPageId = dataLayout.getNextPageId();
+                } finally {
+                    bufferPool.unpinPage(dataPageId, false);
+                }
+            }
+        } finally {
+            bufferPool.unpinPage(headerPageId, false);
+        }
+        
+        return results;
+    }
+    
+    /**
+     * Deserializes a row from a byte array.
+     * 
+     * @param rowData The serialized row data
+     * @return The deserialized row as a map
+     * @throws IOException If there's an error deserializing the row
+     */
+    private Map<String, Object> deserializeRow(byte[] rowData) throws IOException {
+        com.fasterxml.jackson.databind.ObjectMapper mapper = new com.fasterxml.jackson.databind.ObjectMapper();
+        return mapper.readValue(rowData, Map.class);
     }
     
     /**
